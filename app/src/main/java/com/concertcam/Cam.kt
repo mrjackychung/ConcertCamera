@@ -7,6 +7,7 @@ import android.graphics.Matrix
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaRecorder
@@ -23,6 +24,20 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executor
+
+/** 曝光/测光设置（跨相机重建保留） */
+class Expo {
+    @Volatile var mode = 0          // 0 自动(点测光+EV+高光保护) 1 固定快门·自动ISO 2 手动
+    @Volatile var ev = -1f          // 曝光补偿(档)，演唱会默认-1
+    @Volatile var off = 0f          // 高光保护自动下调(<=0)
+    @Volatile var shutterDen = 60   // 快门 1/x
+    @Volatile var iso = 200
+    @Volatile var spot = true       // 点测光(跟随点击位置)
+    @Volatile var protect = true    // 高光保护(强光/激光自动压曝光)
+    @Volatile var lockAe = false    // 自动锁焦时是否同时锁曝光
+    @Volatile var tapU = -1f        // 上次点击位置(0~1，相对预览)
+    @Volatile var tapV = -1f
+}
 
 /**
  * 一路相机。physId != null：直接锁定某颗物理镜头。
@@ -41,10 +56,14 @@ class Cam(
     nativeZoom: Float,
     private var soft: Boolean,
     private val stab: Int,
+    private val ex: Expo,
     private val onInfo: (String) -> Unit,
     private val onErr: (String) -> Unit
 ) {
     companion object {
+        fun evStep(c: CameraCharacteristics): Float =
+            c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat() ?: 0.33f
+
         fun stabModes(c: CameraCharacteristics): List<Int> {
             val l = mutableListOf(0)
             if (c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
@@ -91,9 +110,23 @@ class Cam(
         .filter { it.width * 9 == it.height * 16 && it.width <= want.width }
         .maxByOrNull { it.width } ?: want
 
+    private val evStepV = evStep(chars)
+    val evRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+    val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+    private val expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+    val manualOk = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+        ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+    private var afRect: MeteringRectangle? = null
+    private var aeRect: MeteringRectangle? = null
+    @Volatile var running = false
+    @Volatile var resIso: Int? = null
+    @Volatile var resExp: Long? = null
+
     private val cb = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
             lastFocus = res.get(CaptureResult.LENS_FOCUS_DISTANCE)
+            res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { resIso = it }
+            res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { resExp = it }
             val id = res.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) ?: return
             activeId = id
             if (!soft) return
@@ -149,7 +182,7 @@ class Cam(
         act.runOnUiThread {
             val vw = tv.width.toFloat(); val vh = tv.height.toFloat()
             if (vw == 0f || vh == 0f) return@runOnUiThread
-            val rot = act.display?.rotation ?: Surface.ROTATION_90
+            val rot = act.display?.rotation ?: Surface.ROTATION_0
             val m = Matrix()
             if (rot == Surface.ROTATION_90 || rot == Surface.ROTATION_270) {
                 val view = RectF(0f, 0f, vw, vh)
@@ -160,6 +193,8 @@ class Cam(
                 val s = maxOf(vh / size.height, vw / size.width)
                 m.postScale(s, s, cx, cy)
                 m.postRotate(90f * (rot - 2), cx, cy)
+            } else if (rot == Surface.ROTATION_180) {
+                m.postRotate(180f, vw / 2, vh / 2)
             }
             tv.setTransform(m)
         }
@@ -192,6 +227,9 @@ class Cam(
                 vs.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION))
                 b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION)
             if (zr != null) b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
+            if (ex.tapU >= 0f) computeRects(ex.tapU, ex.tapV)
+            afRect?.let { b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(it)) }
+            setExp(b)
             req = b
 
             val p = phys
@@ -201,6 +239,7 @@ class Cam(
                     override fun onConfigured(s: CameraCaptureSession) {
                         if (closed) { s.close(); return }
                         ses = s
+                        running = true
                         try {
                             s.setRepeatingRequest(b.build(), cb, h)
                             if (recording) mr?.start()
@@ -247,10 +286,7 @@ class Cam(
             r.setAudioEncodingBitRate(192_000)
             r.setAudioSamplingRate(48_000)
         }
-        val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        val front = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-        val rotDeg = (act.display?.rotation ?: Surface.ROTATION_90) * 90
-        r.setOrientationHint(if (front) (sensor + rotDeg) % 360 else (sensor - rotDeg + 360) % 360)
+        r.setOrientationHint(rotNeeded())
         r.prepare()
         mr = r
     }
@@ -262,6 +298,78 @@ class Cam(
         pfd = null
         uri?.let { try { act.contentResolver.delete(it, null, null) } catch (_: Exception) {} }
         uri = null
+    }
+
+    /** 画面需要顺时针旋转多少度才是正的（同录像方向） */
+    private fun rotNeeded(): Int {
+        val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val front = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+        val rotDeg = (act.display?.rotation ?: Surface.ROTATION_0) * 90
+        return if (front) (sensor + rotDeg) % 360 else (sensor - rotDeg + 360) % 360
+    }
+
+    /** 预览上的点(u,v 0~1) → 传感器坐标的对焦/测光区域 */
+    private fun computeRects(u: Float, v: Float) {
+        val ar = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+        val (xn, yn) = when (rotNeeded()) {
+            0 -> u to v
+            90 -> v to (1f - u)
+            180 -> (1f - u) to (1f - v)
+            else -> (1f - v) to u
+        }
+        val aw = ar.width().toFloat(); val ah = ar.height().toFloat()
+        val z = zoom.coerceAtLeast(1f)
+        val vw = aw / z
+        val vh = minOf(ah, aw * 9f / 16f) / z
+        val x = ar.left + aw / 2 + (xn - 0.5f) * vw
+        val y = ar.top + ah / 2 + (yn - 0.5f) * vh
+        val side = aw / 8f
+        val l = (x - side / 2).coerceIn(ar.left.toFloat(), ar.right - side)
+        val t = (y - side / 2).coerceIn(ar.top.toFloat(), ar.bottom - side)
+        val r = MeteringRectangle(l.toInt(), t.toInt(), side.toInt(), side.toInt(), MeteringRectangle.METERING_WEIGHT_MAX)
+        afRect = r; aeRect = r
+    }
+
+    private fun setExp(b: CaptureRequest.Builder) {
+        if (ex.mode == 0 || !manualOk) {
+            b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            evRange?.let { rg ->
+                val idx = Math.round((ex.ev + ex.off) / evStepV).coerceIn(rg.lower, rg.upper)
+                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, idx)
+            }
+            val r = aeRect
+            b.set(CaptureRequest.CONTROL_AE_REGIONS,
+                arrayOf(if (ex.spot && r != null) r else MeteringRectangle(0, 0, 0, 0, 0)))
+        } else {
+            b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            var t = 1_000_000_000L / ex.shutterDen
+            expRange?.let { t = t.coerceIn(it.lower, it.upper) }
+            b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, t)
+            b.set(CaptureRequest.SENSOR_SENSITIVITY, isoRange?.let { ex.iso.coerceIn(it.lower, it.upper) } ?: ex.iso)
+            b.set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(33_333_333L, t))
+        }
+    }
+
+    fun applyExposure() { val b = req ?: return; setExp(b); push() }
+
+    /** 点击对焦：解除锁定，对焦并测光到点击处 */
+    fun tapFocus(u: Float, v: Float) {
+        ex.tapU = u; ex.tapV = v
+        computeRects(u, v)
+        val b = req ?: return
+        val s = ses ?: return
+        try {
+            locked = false; manualFocus = false
+            b.set(CaptureRequest.CONTROL_AE_LOCK, false)
+            b.set(CaptureRequest.CONTROL_AWB_LOCK, false)
+            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+            afRect?.let { b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(it)) }
+            setExp(b)
+            b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            s.capture(b.build(), null, h)
+            b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            push()
+        } catch (_: Exception) {}
     }
 
     private fun push() {
@@ -303,7 +411,7 @@ class Cam(
                     s.capture(b.build(), null, h)
                     b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
                 }
-                b.set(CaptureRequest.CONTROL_AE_LOCK, true)
+                b.set(CaptureRequest.CONTROL_AE_LOCK, ex.lockAe && ex.mode == 0)
                 b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
             } else {
                 b.set(CaptureRequest.CONTROL_AE_LOCK, false)
@@ -322,6 +430,7 @@ class Cam(
 
     fun close() {
         closed = true
+        running = false
         try { ses?.stopRepeating() } catch (_: Exception) {}
         mr?.let { try { it.stop() } catch (_: Exception) {}; it.release() }
         mr = null
