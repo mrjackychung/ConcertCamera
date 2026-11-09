@@ -122,12 +122,20 @@ class MainActivity : Activity(), SensorEventListener {
         return Pair("$name %.1fx (%s) %dmm".format(r, tag, eq), r)
     }
 
+    private var allIds = listOf<String>()
+
     private fun scanLenses() {
-        frontId = cm.cameraIdList.firstOrNull {
+        val listed = cm.cameraIdList.toList()
+        // 探测系统没有列出、但其实存在的ID(部分机型的长焦等辅助镜头藏在这里)
+        val hidden = (0..9).map { it.toString() }.filter { it !in listed }.filter {
+            try { chars(it); true } catch (_: Exception) { false }
+        }
+        allIds = listed + hidden
+        frontId = allIds.firstOrNull {
             val c = chars(it)
             c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT && valid(c)
         }
-        val backs = cm.cameraIdList.filter {
+        val backs = allIds.filter {
             val c = chars(it)
             c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK && valid(c)
         }
@@ -145,12 +153,18 @@ class MainActivity : Activity(), SensorEventListener {
                 continue
             }
             for ((p, e) in items) {
-                val (label, r) = lensLabel(e, ref, "物理$p")
-                val nz = if (zr == null) 1f else r.coerceIn(zr.lower, zr.upper)
-                lenses += Lens(label, id, p, nz)
+                if (p in backs) {   // 该物理镜头能直接打开：优先直连(最稳)
+                    lenses += Lens(lensLabel(e, ref, "直连ID$p").first, p, null, 1f)
+                } else {
+                    val (label, r) = lensLabel(e, ref, "物理流$p")
+                    val nz = if (zr == null) 1f else r.coerceIn(zr.lower, zr.upper)
+                    lenses += Lens(label, id, p, nz)
+                }
             }
             lenses += Lens("系统镜头·软锁1x (ID$id)", id, null, 1f, true)
         }
+        for (id in backs) if (id in physSet && lenses.none { it.openId == id })
+            lenses += Lens(lensLabel(eqMm(chars(id)), ref, "直连ID$id").first, id, null, 1f)
         lensIdx = lenses.indexOfFirst { it.label.startsWith("主摄") }.coerceAtLeast(0)
     }
 
@@ -345,15 +359,16 @@ class MainActivity : Activity(), SensorEventListener {
     private fun showDiag() {
         val txt = buildString {
             appendLine("Android ${Build.VERSION.SDK_INT}  ${Build.MODEL}")
-            for (id in cm.cameraIdList) {
+            for (id in allIds) {
                 val c = chars(id)
-                appendLine("ID$id 朝向=${c.get(CameraCharacteristics.LENS_FACING)} ${eqMm(c)}mm 可录像=${valid(c)} " +
+                appendLine("ID$id${if (id !in cm.cameraIdList) "(隐藏)" else ""} 朝向=${c.get(CameraCharacteristics.LENS_FACING)} ${eqMm(c)}mm 可录像=${valid(c)} " +
                     "缩放=${c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)} 防抖=${Cam.stabModes(c)}")
                 for (p in c.physicalCameraIds) {
                     try { appendLine("   └物理$p ${eqMm(chars(p))}mm") } catch (_: Exception) { appendLine("   └物理$p 无法读取") }
                 }
             }
             appendLine("可同时开启: " + try { cm.concurrentCameraIds.toString() } catch (_: Exception) { "无" })
+            lenses.forEach { appendLine("镜头项: ${it.label} open=${it.openId} phys=${it.phys}") }
             appendLine("当前: ${lenses.getOrNull(lensIdx)?.label}")
             appendLine("系统实际使用的物理镜头ID: ${cams.firstOrNull()?.activeId}")
             appendLine("最近错误: $lastErr")
