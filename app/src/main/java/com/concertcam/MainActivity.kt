@@ -2,14 +2,21 @@ package com.concertcam
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CameraManager
+import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -32,12 +39,13 @@ import kotlin.math.sqrt
 class MainActivity : Activity(), SensorEventListener {
 
     // ===== 可调参数 =====
-    private val STABLE = 0.25f        // 角速度低于此值(rad/s)算"稳定对准"
-    private val LOCK_AFTER_MS = 5000f // 稳定多久后自动锁定
-    private val PAN_ANGLE = 0.26f     // 净转动超过约15°算"换目标"
+    private val STABLE = 0.25f           // 角速度低于此值(rad/s)算"稳定对准"
+    private val LOCK_AFTER_MS = 5000f    // 稳定多久后自动锁定
+    private val PAN_ANGLE = 0.26f        // 净转动超过约15°算"换目标"
     private val RELOCK_SETTLE_MS = 3000f // 换目标后稳定多久才解锁重新对焦
 
-    private data class Lens(val label: String, val openId: String, val phys: String?)
+    /** nz: 该镜头的原生缩放倍率(相对主摄)；soft: 系统镜头+软锁定 */
+    private data class Lens(val label: String, val openId: String, val phys: String?, val nz: Float, val soft: Boolean = false)
 
     private lateinit var cm: CameraManager
     private lateinit var sm: SensorManager
@@ -49,8 +57,10 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var bMode: Button
     private lateinit var bLens: Button
     private lateinit var bRes: Button
+    private lateinit var bStab: Button
     private lateinit var bAuto: Button
     private lateinit var bLock: Button
+    private lateinit var bDiag: Button
 
     private val ui = Handler(Looper.getMainLooper())
     private val cams = mutableListOf<Cam>()
@@ -60,11 +70,14 @@ class MainActivity : Activity(), SensorEventListener {
     private var lensIdx = 0
     private var mode = 0            // 0 后置 1 前置 2 前后同录
     private var res4k = false
+    private var stab = 1            // 0 关 1 光学 2 光学+电子 3 增强
     private var recording = false
     private var auto = true
-    private var zoom = 1f
     private var recStart = 0L
     private var askedPerm = false
+    private var lastErr = "无"
+    private var lw = 0
+    private var lh = 0
 
     // 陀螺仪状态
     private var last = 0L
@@ -86,6 +99,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun chars(id: String) = cm.getCameraCharacteristics(id)
 
     private fun eqMm(c: CameraCharacteristics): Int {
         val f = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: return 0
@@ -93,20 +107,50 @@ class MainActivity : Activity(), SensorEventListener {
         return Math.round(f * 43.27f / hypot(s.width, s.height))
     }
 
+    /** 只保留能录像的普通镜头（过滤景深/黑白等辅助镜头） */
+    private fun valid(c: CameraCharacteristics): Boolean {
+        val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: return false
+        if (!caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE)) return false
+        return c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(MediaRecorder::class.java)?.isNotEmpty() == true
+    }
+
+    private fun lensLabel(eq: Int, ref: Int, tag: String): Pair<String, Float> {
+        val r = if (eq == 0 || ref == 0) 1f else eq.toFloat() / ref
+        val name = if (r < 0.8f) "超广角" else if (r < 1.6f) "主摄" else "长焦"
+        return Pair("$name %.1fx (%s) %dmm".format(r, tag, eq), r)
+    }
+
     private fun scanLenses() {
-        for (id in cm.cameraIdList) {
-            val c = cm.getCameraCharacteristics(id)
-            when (c.get(CameraCharacteristics.LENS_FACING)) {
-                CameraCharacteristics.LENS_FACING_FRONT -> if (frontId == null) frontId = id
-                CameraCharacteristics.LENS_FACING_BACK -> {
-                    lenses += Lens("ID$id ${eqMm(c)}mm", id, null)
-                    for (p in c.physicalCameraIds) {
-                        val pc = cm.getCameraCharacteristics(p)
-                        lenses += Lens("ID$id→物理$p ${eqMm(pc)}mm", id, p)
-                    }
-                }
-            }
+        frontId = cm.cameraIdList.firstOrNull {
+            val c = chars(it)
+            c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT && valid(c)
         }
+        val backs = cm.cameraIdList.filter {
+            val c = chars(it)
+            c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK && valid(c)
+        }
+        val physSet = backs.flatMap { chars(it).physicalCameraIds }.toSet()
+        val ref = backs.firstOrNull { it !in physSet }?.let { eqMm(chars(it)) } ?: 0
+        for (id in backs) {
+            if (id in physSet) continue
+            val c = chars(id)
+            val zr = c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            val items = c.physicalCameraIds.mapNotNull { p ->
+                try { p to eqMm(chars(p)) } catch (_: Exception) { null }
+            }.sortedBy { it.second }
+            if (items.isEmpty()) {
+                lenses += Lens(lensLabel(eqMm(c), ref, "ID$id").first, id, null, 1f)
+                continue
+            }
+            for ((p, e) in items) {
+                val (label, r) = lensLabel(e, ref, "物理$p")
+                val nz = if (zr == null) 1f else r.coerceIn(zr.lower, zr.upper)
+                lenses += Lens(label, id, p, nz)
+            }
+            lenses += Lens("系统镜头·软锁1x (ID$id)", id, null, 1f, true)
+        }
+        lensIdx = lenses.indexOfFirst { it.label.startsWith("主摄") }.coerceAtLeast(0)
     }
 
     private fun buildUi() {
@@ -123,53 +167,84 @@ class MainActivity : Activity(), SensorEventListener {
         })
 
         fun btn(click: () -> Unit) = Button(this).apply {
-            textSize = 12f; alpha = 0.85f; isAllCaps = false
+            textSize = 11f; alpha = 0.85f; isAllCaps = false; setPadding(4, 0, 4, 0)
             setOnClickListener { click() }
         }
         bRec = btn { toggleRec() }
         bMode = btn { cycleMode() }
         bLens = btn { cycleLens() }
-        bRes = btn { if (!recording) { res4k = !res4k; rebuild() } }
+        bRes = btn { if (!recording) { res4k = !res4k; rebuild() } else toast("请先停止录制") }
+        bStab = btn { cycleStab() }
         bAuto = btn { auto = !auto; resetGyro(); refreshUi() }
         bLock = btn { cams.firstOrNull()?.let { it.setLock(!it.locked); resetGyro() } }
+        bDiag = btn { showDiag() }; bDiag.text = "诊断信息"
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            listOf(bRec, bMode, bLens, bRes, bAuto, bLock).forEach { addView(it, LinearLayout.LayoutParams(dp(130), dp(46))) }
+            listOf(bRec, bMode, bLens, bRes, bStab, bAuto, bLock, bDiag).forEach {
+                addView(it, LinearLayout.LayoutParams(dp(132), dp(38)))
+            }
         }
         root.addView(col, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(8) })
 
         val sd = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(d: ScaleGestureDetector): Boolean {
-                zoom *= d.scaleFactor
-                cams.firstOrNull()?.let { zoom = it.setZoom(zoom) }
+                cams.firstOrNull()?.let { it.setZoom(it.zoom * d.scaleFactor) }
                 return true
             }
         })
         root.setOnTouchListener { _, e -> sd.onTouchEvent(e); true }
         setContentView(root)
-        root.post {
-            val w = root.width; val hh = root.height
-            var tw = w; var th = w * 9 / 16
-            if (th > hh) { th = hh; tw = hh * 16 / 9 }
-            mainTv.layoutParams = FrameLayout.LayoutParams(tw, th, Gravity.CENTER)
-        }
+        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> root.post { layoutMain() } }
         refreshUi()
         ui.post(object : Runnable {
             override fun run() { tick(); ui.postDelayed(this, 250) }
         })
     }
 
+    /** 主预览按16:9居中；预览矫正在布局后重新计算 */
+    private fun layoutMain() {
+        val w = root.width; val hh = root.height
+        if (w == 0 || hh == 0) return
+        var tw = w; var th = w * 9 / 16
+        if (th > hh) { th = hh; tw = hh * 16 / 9 }
+        if (tw != lw || th != lh) {
+            lw = tw; lh = th
+            mainTv.layoutParams = FrameLayout.LayoutParams(tw, th, Gravity.CENTER)
+        }
+        ui.postDelayed({ cams.forEach { it.applyTransform() } }, 150)
+    }
+
+    override fun onConfigurationChanged(c: Configuration) {
+        super.onConfigurationChanged(c)
+        ui.postDelayed({ cams.forEach { it.applyTransform() } }, 250)
+    }
+
+    private fun stabName() = listOf("防抖:关", "防抖:光学", "防抖:光学+电子", "防抖:增强")[stab.coerceIn(0, 3)]
+
     private fun refreshUi() {
         bRec.text = if (recording) "■ 停止录制" else "● 开始录制"
         bMode.text = listOf("后置", "前置", "前后同录")[mode]
         bLens.text = lenses.getOrNull(lensIdx)?.label ?: "无后置镜头"
         bRes.text = if (res4k) "4K" else "1080p"
+        bStab.text = stabName()
         bAuto.text = if (auto) "自动锁焦:开" else "自动锁焦:关"
-        val l = cams.firstOrNull()?.locked == true
-        bLock.text = if (l) "解锁对焦" else "手动锁焦"
+        bLock.text = if (cams.firstOrNull()?.locked == true) "解锁对焦" else "手动锁焦"
     }
 
     private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_LONG).show() }
+
+    private fun curChars(): CameraCharacteristics? {
+        val id = if (mode == 1) frontId else lenses.getOrNull(lensIdx)?.openId
+        return id?.let { chars(it) }
+    }
+
+    private fun cycleStab() {
+        if (recording) { toast("请先停止录制"); return }
+        val modes = curChars()?.let { Cam.stabModes(it) } ?: return
+        stab = modes[(modes.indexOf(stab) + 1) % modes.size]
+        if (stab >= 2) toast("电子防抖会裁切画面(视角变窄)，但手持更稳")
+        rebuild()
+    }
 
     private fun dualOk(): Boolean {
         val f = frontId ?: return false
@@ -190,7 +265,7 @@ class MainActivity : Activity(), SensorEventListener {
         if (recording) { toast("请先停止录制"); return }
         if (lenses.isEmpty()) return
         lensIdx = (lensIdx + 1) % lenses.size
-        zoom = 1f
+        if (mode == 1) mode = 0
         rebuild()
     }
 
@@ -218,32 +293,56 @@ class MainActivity : Activity(), SensorEventListener {
         pipTv.visibility = if (mode == 2) View.VISIBLE else View.GONE
         resetGyro()
         refreshUi()
-        ui.postDelayed(startRunnable, 450)
+        ui.postDelayed(startRunnable, 500)
     }
 
-    private fun mk(tv: TextureView, id: String, phys: String?, audio: Boolean, tag: String) =
-        Cam(this, cm, tv, id, phys, want(), audio, tag) { msg ->
-            toast(msg)
-            runOnUiThread { if (recording) { recording = false; refreshUi() } }
-        }
+    private fun mk(tv: TextureView, id: String, phys: String?, nz: Float, soft: Boolean, audio: Boolean, tag: String) =
+        Cam(this, cm, tv, id, phys, want(), audio, tag, nz, soft, stab,
+            { msg -> lastErr = msg; toast(msg) },
+            { msg ->
+                lastErr = msg; toast(msg)
+                runOnUiThread { if (recording) { recording = false; rebuild() } }
+            })
 
     private fun startAll() {
         if (!granted()) return
         try {
             val l = lenses.getOrNull(lensIdx)
+            curChars()?.let { val m = Cam.stabModes(it); if (stab !in m) stab = if (1 in m) 1 else 0 }
             when (mode) {
-                0 -> if (l != null) cams += mk(mainTv, l.openId, l.phys, true, "back")
-                1 -> cams += mk(mainTv, frontId!!, null, true, "front")
+                0 -> if (l != null) cams += mk(mainTv, l.openId, l.phys, l.nz, l.soft, true, "back")
+                1 -> cams += mk(mainTv, frontId!!, null, 1f, false, true, "front")
                 else -> {
-                    cams += mk(mainTv, l!!.openId, null, true, "back")
-                    cams += mk(pipTv, frontId!!, null, false, "front")
+                    cams += mk(mainTv, l!!.openId, null, 1f, true, true, "back")
+                    cams += mk(pipTv, frontId!!, null, 1f, false, false, "front")
                 }
             }
-            cams.firstOrNull()?.zoom = zoom
             cams.forEach { it.start(recording) }
         } catch (e: Exception) {
-            toast("启动失败: ${e.message}")
+            lastErr = "启动失败: ${e.message}"; toast(lastErr)
         }
+    }
+
+    private fun showDiag() {
+        val txt = buildString {
+            appendLine("Android ${Build.VERSION.SDK_INT}  ${Build.MODEL}")
+            for (id in cm.cameraIdList) {
+                val c = chars(id)
+                appendLine("ID$id 朝向=${c.get(CameraCharacteristics.LENS_FACING)} ${eqMm(c)}mm 可录像=${valid(c)} " +
+                    "缩放=${c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)} 防抖=${Cam.stabModes(c)}")
+                for (p in c.physicalCameraIds) {
+                    try { appendLine("   └物理$p ${eqMm(chars(p))}mm") } catch (_: Exception) { appendLine("   └物理$p 无法读取") }
+                }
+            }
+            appendLine("可同时开启: " + try { cm.concurrentCameraIds.toString() } catch (_: Exception) { "无" })
+            appendLine("当前: ${lenses.getOrNull(lensIdx)?.label}")
+            appendLine("系统实际使用的物理镜头ID: ${cams.firstOrNull()?.activeId}")
+            appendLine("最近错误: $lastErr")
+        }
+        AlertDialog.Builder(this).setTitle("诊断信息").setMessage(txt)
+            .setPositiveButton("复制") { _, _ ->
+                (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("diag", txt))
+            }.setNegativeButton("关闭", null).show()
     }
 
     // ===== 陀螺仪：自动锁焦 / 自动解锁 =====
@@ -263,21 +362,14 @@ class MainActivity : Activity(), SensorEventListener {
         if (!auto) return
         if (!cam.locked) {
             if (ema < STABLE) stableMs += dt * 1000f else stableMs = 0f
-            if (stableMs >= LOCK_AFTER_MS) {
-                cam.setLock(true)
-                resetGyro()
-            }
+            if (stableMs >= LOCK_AFTER_MS) { cam.setLock(true); resetGyro() }
         } else {
-            // 带衰减的转动积分：手抖会互相抵消，真正摇镜头才会累积
             val k = maxOf(0f, 1f - dt / 20f)
             vx = vx * k + x * dt; vy = vy * k + y * dt; vz = vz * k + z * dt
             if (sqrt(vx * vx + vy * vy + vz * vz) > PAN_ANGLE) moved = true
             if (moved) {
                 if (ema < STABLE) settleMs += dt * 1000f else settleMs = 0f
-                if (settleMs >= RELOCK_SETTLE_MS) {
-                    cam.setLock(false)
-                    resetGyro()
-                }
+                if (settleMs >= RELOCK_SETTLE_MS) { cam.setLock(false); resetGyro() }
             }
         }
     }
@@ -292,7 +384,7 @@ class MainActivity : Activity(), SensorEventListener {
             auto -> "自动对焦中  稳定 %.1f / %.0f s".format(stableMs / 1000f, LOCK_AFTER_MS / 1000f)
             else -> "自动对焦（自动锁焦已关）"
         }
-        var t = "%.1fx  ${cam?.size?.width ?: 0}p\n$af".format(zoom)
+        var t = "%.1fx  %dp  实际镜头ID:%s\n%s".format(cam?.zoom ?: 1f, cam?.size?.height ?: 0, cam?.activeId ?: "-", af)
         if (recording) {
             val s = (SystemClock.elapsedRealtime() - recStart) / 1000
             t += "\n● REC %02d:%02d".format(s / 60, s % 60)
