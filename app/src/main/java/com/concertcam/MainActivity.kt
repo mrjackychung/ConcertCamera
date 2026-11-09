@@ -61,6 +61,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var bAuto: Button
     private lateinit var bLock: Button
     private lateinit var bDiag: Button
+    private lateinit var presetBar: LinearLayout
 
     private val ui = Handler(Looper.getMainLooper())
     private val cams = mutableListOf<Cam>()
@@ -186,6 +187,9 @@ class MainActivity : Activity(), SensorEventListener {
         }
         root.addView(col, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(8) })
 
+        presetBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        root.addView(presetBar, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(8) })
+
         val sd = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(d: ScaleGestureDetector): Boolean {
                 cams.firstOrNull()?.let { it.setZoom(it.zoom * d.scaleFactor) }
@@ -238,6 +242,20 @@ class MainActivity : Activity(), SensorEventListener {
         return id?.let { chars(it) }
     }
 
+    private fun buildPresets() {
+        presetBar.removeAllViews()
+        val r = curChars()?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) ?: return
+        val list = (listOf(r.lower).filter { it < 0.9f } + listOf(1f, 2f, 3f, 5f)).filter { it <= r.upper }
+        for (z in list) {
+            val b = Button(this).apply {
+                text = "%.1fx".format(z).replace(".0x", "x"); textSize = 12f; alpha = 0.85f; isAllCaps = false
+                setPadding(2, 0, 2, 0)
+                setOnClickListener { cams.firstOrNull()?.preset(z) }
+            }
+            presetBar.addView(b, LinearLayout.LayoutParams(dp(58), dp(40)))
+        }
+    }
+
     private fun cycleStab() {
         if (recording) { toast("请先停止录制"); return }
         val modes = curChars()?.let { Cam.stabModes(it) } ?: return
@@ -263,7 +281,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun cycleLens() {
         if (recording) { toast("请先停止录制"); return }
-        if (lenses.isEmpty()) return
+        if (lenses.size <= 1) { toast("本机只开放了一个系统镜头，请用底部 0.6x/1x/3x 按钮切换镜头（会自动锁住不乱切）"); return }
         lensIdx = (lensIdx + 1) % lenses.size
         if (mode == 1) mode = 0
         rebuild()
@@ -309,6 +327,7 @@ class MainActivity : Activity(), SensorEventListener {
         try {
             val l = lenses.getOrNull(lensIdx)
             curChars()?.let { val m = Cam.stabModes(it); if (stab !in m) stab = if (1 in m) 1 else 0 }
+            buildPresets()
             when (mode) {
                 0 -> if (l != null) cams += mk(mainTv, l.openId, l.phys, l.nz, l.soft, true, "back")
                 1 -> cams += mk(mainTv, frontId!!, null, 1f, false, true, "front")

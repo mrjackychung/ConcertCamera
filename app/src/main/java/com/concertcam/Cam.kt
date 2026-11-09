@@ -58,6 +58,7 @@ class Cam(
     }
 
     private var phys = physId
+    init { if (physId == null) soft = true }
     private val chars = cm.getCameraCharacteristics(openId)
     private val ht = HandlerThread("cam$openId").also { it.start() }
     private val h = Handler(ht.looper)
@@ -77,7 +78,7 @@ class Cam(
     @Volatile var activeId: String? = null
 
     private val zr = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
-    private val zMin = if (zr == null) 1f else nativeZoom.coerceIn(zr.lower, zr.upper)
+    private var zMin = if (zr == null) 1f else nativeZoom.coerceIn(zr.lower, zr.upper)
     private var zCap = zr?.upper ?: 1f
     @Volatile var zoom = zMin
 
@@ -98,7 +99,7 @@ class Cam(
             if (!soft) return
             val lk = lockedId
             if (lk == null) {
-                if (++frames > 15) lockedId = id
+                if (++frames > 20) lockedId = id
             } else if (id != lk && zoom > zMin) {
                 val now = System.nanoTime()
                 if (now - lastAdj > 400_000_000L) {   // 系统想切镜头：把缩放压回去
@@ -265,6 +266,16 @@ class Cam(
 
     private fun push() {
         try { ses?.setRepeatingRequest(req!!.build(), cb, h) } catch (_: Exception) {}
+    }
+
+    /** 变焦预设：选定一档后把系统锁在对应镜头上（下限=该档，系统想切换时自动压回） */
+    fun preset(t: Float) {
+        val r = zr ?: return
+        if (phys != null) { setZoom(t); return }
+        zCap = r.upper
+        zMin = t.coerceIn(r.lower, r.upper)
+        lockedId = null; frames = 0
+        setZoom(zMin)
     }
 
     fun setZoom(z: Float): Float {
