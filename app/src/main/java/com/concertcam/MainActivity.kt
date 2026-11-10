@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.PointF
 import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -25,6 +26,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Size
 import android.view.GestureDetector
+import android.view.HapticFeedbackConstants
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -65,7 +67,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var pipTv: TextureView
     private lateinit var status: TextView
     private lateinit var ring: View
-    private lateinit var presetBar: LinearLayout
+    private lateinit var zoomRail: ZoomRail
     private lateinit var expPanel: LinearLayout
     private lateinit var evRow: LinearLayout
     private lateinit var shRow: LinearLayout
@@ -80,7 +82,9 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var bMode: Button
     private lateinit var bGear: Button
     private lateinit var fan: FrameLayout
-    private class FanItem(val title: String, val state: () -> String, val act: () -> Unit)
+    private class FanItem(val title: String, val state: () -> String,
+                          val opts: () -> List<Pair<String, () -> Unit>> = { emptyList() },
+                          val act: (() -> Unit)? = null)
     private val fanItems = mutableListOf<FanItem>()
     private val fanViews = mutableListOf<Button>()
     private val hidePanel = Runnable { expPanel.visibility = View.GONE }
@@ -253,18 +257,34 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         // ---- 右侧操作条（单手拇指区） ----
-        presetBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
+        zoomRail = ZoomRail(this).apply {
+            onPreset = { z -> cams.firstOrNull()?.preset(z) }
+            onFree = { z -> cams.firstOrNull()?.setZoom(z) }
+        }
         bRec = Button(this).apply {
             textSize = 26f; setTextColor(Color.WHITE)
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.rgb(220, 40, 40)); setStroke(dp(3), Color.WHITE) }
             setOnClickListener { toggleRec() }
         }
         bMode = chip { cycleMode() }
-        bGear = chip("⚙ 设置") { openFanAtView(bGear) }
+        bGear = chip("⚙ 设置") {}
+        // 点击=打开菜单；长按后不抬手直接滑到图标上，放手即设置；悬停在带子菜单的图标上会展开下一层
+        bGear.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { v.parent.requestDisallowInterceptTouchEvent(true); ui.postDelayed(gearLong, 350) }
+                MotionEvent.ACTION_MOVE -> if (fanDragging) fanTouch(e.rawX, e.rawY, e.actionMasked)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    ui.removeCallbacks(gearLong)
+                    if (fanDragging) fanTouch(e.rawX, e.rawY, e.actionMasked)
+                    else if (e.actionMasked == MotionEvent.ACTION_UP) { if (fan.visibility == View.VISIBLE) closeFan() else openFanAtView(bGear) }
+                }
+            }
+            true
+        }
         val rail = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(4), dp(8), dp(4), dp(8))
-            addView(presetBar)
+            addView(zoomRail, LinearLayout.LayoutParams(dp(72), dp(240)))
             addView(bRec, LinearLayout.LayoutParams(dp(76), dp(76)).apply { setMargins(0, dp(14), 0, dp(14)) })
             addView(bMode, LinearLayout.LayoutParams(dp(72), dp(40)))
             addView(bGear, LinearLayout.LayoutParams(dp(72), dp(40)).apply { topMargin = dp(8) })
@@ -277,20 +297,27 @@ class MainActivity : Activity(), SensorEventListener {
         expPanel.setPadding(dp(10), dp(8), dp(10), dp(8))
         root.addView(expPanel, FrameLayout.LayoutParams(dp(300), -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(88) })
 
-        // ---- 扇形菜单项 ----
-        fanItems += FanItem("镜头", { lenses.getOrNull(lensIdx)?.label?.substringBefore(" (") ?: "无" }) { cycleLens() }
-        fanItems += FanItem("画质", { if (res4k) "4K" else "1080p" }) { if (!recording) { res4k = !res4k; rebuild() } else toast("请先停止录制") }
-        fanItems += FanItem("防抖", { listOf("关", "光学", "光学+电", "增强")[stab.coerceIn(0, 3)] }) { cycleStab() }
-        fanItems += FanItem("曝光", { listOf("自动", "快门优先", "手动")[ex.mode] }) { cycleExpMode() }
-        fanItems += FanItem("滑杆", { if (expPanel.visibility == View.VISIBLE) "开" else "关" }) {
-            if (expPanel.visibility == View.VISIBLE) expPanel.visibility = View.GONE else showExp()
-        }
-        fanItems += FanItem("高光保护", { if (ex.protect) "开" else "关" }) { ex.protect = !ex.protect; ex.off = 0f; cams.firstOrNull()?.applyExposure() }
-        fanItems += FanItem("测光", { if (ex.spot) "点击处" else "全局" }) { ex.spot = !ex.spot; cams.firstOrNull()?.applyExposure() }
-        fanItems += FanItem("手动锁焦", { if (cams.firstOrNull()?.locked == true) "已锁" else "未锁" }) { cams.firstOrNull()?.let { it.setLock(!it.locked); resetGyro() } }
-        fanItems += FanItem("自动锁焦", { if (auto) "开" else "关" }) { auto = !auto; resetGyro() }
-        fanItems += FanItem("锁曝光", { if (ex.lockAe) "开" else "关" }) { ex.lockAe = !ex.lockAe }
-        fanItems += FanItem("诊断", { "" }) { closeFan(); showDiag() }
+        // ---- 扇形菜单项（有子选项的，悬停/点击会展开下一层） ----
+        fanItems += FanItem("镜头", { lenses.getOrNull(lensIdx)?.label?.substringBefore(" (") ?: "无" },
+            { if (lenses.size > 1) lenses.mapIndexed { i, l -> o(l.label.substringBefore(" (")) { setLens(i) } } else emptyList() },
+            { toast("本机只开放了一个系统镜头，请用右侧变焦条切换（会自动锁住不乱切）") })
+        fanItems += FanItem("画质", { if (res4k) "4K" else "1080p" }, { listOf(o("1080p") { setRes(false) }, o("4K") { setRes(true) }) })
+        fanItems += FanItem("防抖", { stabNames[stab.coerceIn(0, 3)] },
+            { (curChars()?.let { Cam.stabModes(it) } ?: listOf(0)).map { m -> o(stabNames[m]) { setStab(m) } } })
+        fanItems += FanItem("曝光", { expNames[ex.mode] }, { (0..2).map { n -> o(expNames[n]) { setExpMode(n) } } })
+        fanItems += FanItem("滑杆", { if (expPanel.visibility == View.VISIBLE) "开" else "关" },
+            act = { if (expPanel.visibility == View.VISIBLE) expPanel.visibility = View.GONE else showExp() })
+        fanItems += FanItem("高光保护", { if (ex.protect) "开" else "关" },
+            { listOf(o("开") { ex.protect = true; ex.off = 0f; applyExp() }, o("关") { ex.protect = false; ex.off = 0f; applyExp() }) })
+        fanItems += FanItem("测光", { if (ex.spot) "点击处" else "全局" },
+            { listOf(o("点击处") { ex.spot = true; applyExp() }, o("全局") { ex.spot = false; applyExp() }) })
+        fanItems += FanItem("手动锁焦", { if (cams.firstOrNull()?.locked == true) "已锁" else "未锁" },
+            { listOf(o("锁定") { cams.firstOrNull()?.setLock(true) }, o("解锁") { cams.firstOrNull()?.setLock(false); resetGyro() }) })
+        fanItems += FanItem("自动锁焦", { if (auto) "开" else "关" },
+            { listOf(o("开") { auto = true; resetGyro() }, o("关") { auto = false; resetGyro() }) })
+        fanItems += FanItem("锁曝光", { if (ex.lockAe) "开" else "关" },
+            { listOf(o("开") { ex.lockAe = true }, o("关") { ex.lockAe = false }) })
+        fanItems += FanItem("诊断", { "" }, act = { closeFan(); showDiag() })
         fan = FrameLayout(this).apply {
             setBackgroundColor(Color.argb(90, 0, 0, 0)); isClickable = true; visibility = View.GONE
             setOnClickListener { closeFan() }
@@ -305,7 +332,7 @@ class MainActivity : Activity(), SensorEventListener {
             }
         })
         val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onLongPress(e: MotionEvent) { openFan(e.x, e.y) }
+            override fun onLongPress(e: MotionEvent) { openFan(e.x, e.y); fanDragging = true }
 
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 val u = (e.x - mainTv.x) / mainTv.width
@@ -318,7 +345,11 @@ class MainActivity : Activity(), SensorEventListener {
                 return true
             }
         })
-        root.setOnTouchListener { _, e -> sd.onTouchEvent(e); if (!sd.isInProgress) gd.onTouchEvent(e); true }
+        root.setOnTouchListener { _, e ->
+            if (fanDragging) fanTouch(e.rawX, e.rawY, e.actionMasked)
+            else { sd.onTouchEvent(e); if (!sd.isInProgress) gd.onTouchEvent(e) }
+            true
+        }
         setContentView(root)
         root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> root.post { layoutMain() } }
         refreshUi()
@@ -366,7 +397,39 @@ class MainActivity : Activity(), SensorEventListener {
         if (fan.visibility == View.VISIBLE) refreshFan()
     }
 
-    // ===================== 扇形菜单 =====================
+    // ===================== 扇形菜单（点击 / 长按滑动选择 / 悬停展开下一层） =====================
+    private val stabNames = listOf("关", "光学", "光学+电", "增强")
+    private val expNames = listOf("自动", "快门优先", "手动")
+    private val fanPos = mutableListOf<PointF>()
+    private val subViews = mutableListOf<Button>()
+    private val subPos = mutableListOf<PointF>()
+    private val subOpts = mutableListOf<Pair<String, () -> Unit>>()
+    private var fanAx = 0f; private var fanAy = 0f
+    private var fanDragging = false
+    private var hoverMain = -1; private var hoverSub = -1; private var subOf = -1
+    private val dwell = Runnable { if (hoverMain >= 0 && hoverMain != subOf && fanItems[hoverMain].opts().isNotEmpty()) openSub(hoverMain) }
+    private val gearLong = Runnable { openFanAtView(bGear); fanDragging = true }
+
+    private fun o(label: String, f: () -> Unit): Pair<String, () -> Unit> = label to f
+    private fun applyExp() { cams.firstOrNull()?.applyExposure() }
+
+    private fun styleBtn(b: Button, hovered: Boolean, selected: Boolean, dim: Boolean) {
+        b.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(if (hovered) Color.argb(245, 80, 70, 10) else Color.argb(225, 30, 30, 30))
+            setStroke(dp(if (hovered || selected) 3 else 1),
+                if (hovered) Color.YELLOW else if (selected) Color.rgb(90, 200, 255) else Color.WHITE)
+        }
+        val sc = if (hovered) 1.25f else 1f
+        b.scaleX = sc; b.scaleY = sc
+        b.alpha = if (dim) 0.4f else 1f
+    }
+
+    private fun mkFanBtn(sp: Float) = Button(this).apply {
+        isAllCaps = false; textSize = sp; setTextColor(Color.WHITE)
+        setPadding(0, 0, 0, 0); minWidth = 0; minHeight = 0; minimumWidth = 0; minimumHeight = 0
+    }
+
     private fun openFanAtView(v: View) {
         val a = IntArray(2); val r = IntArray(2)
         v.getLocationInWindow(a); root.getLocationInWindow(r)
@@ -375,39 +438,117 @@ class MainActivity : Activity(), SensorEventListener {
 
     /** 以(ax,ay)为圆心向屏幕内侧弹出两圈半圆扇形 */
     private fun openFan(ax: Float, ay: Float) {
-        fan.removeAllViews(); fanViews.clear()
+        closeFan()
+        root.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        fanAx = ax; fanAy = ay
         val leftDir = ax > root.width / 2f
         val sz = dp(62)
         val rings = listOf(Pair(dp(100).toFloat(), 5), Pair(dp(178).toFloat(), 6))
         var idx = 0
-        for ((rad, n) in rings) {
-            for (k in 0 until n) {
-                if (idx >= fanItems.size) break
-                val item = fanItems[idx++]
-                val deg = if (n == 5) 90.0 + k * 45.0 else 100.0 + k * 32.0
-                val th = Math.toRadians(deg)
-                val dx = (Math.cos(th) * rad).toFloat() * (if (leftDir) 1f else -1f)
-                val dy = (-Math.sin(th) * rad).toFloat()
-                val cx = (ax + dx).coerceIn(sz / 2f + dp(4), root.width - sz / 2f - dp(4))
-                val cy = (ay + dy).coerceIn(sz / 2f + dp(40), root.height - sz / 2f - dp(8))
-                val b = Button(this).apply {
-                    isAllCaps = false; textSize = 10.5f; setTextColor(Color.WHITE)
-                    setPadding(0, 0, 0, 0); minWidth = 0; minHeight = 0; minimumWidth = 0; minimumHeight = 0
-                    background = GradientDrawable().apply {
-                        shape = GradientDrawable.OVAL; setColor(Color.argb(225, 30, 30, 30)); setStroke(dp(1), Color.WHITE)
-                    }
-                    setOnClickListener { item.act(); refreshFan() }
-                }
-                val lp = FrameLayout.LayoutParams(sz, sz).apply {
-                    leftMargin = (cx - sz / 2f).toInt(); topMargin = (cy - sz / 2f).toInt()
-                }
-                fan.addView(b, lp); fanViews += b
-                b.translationX = ax - cx; b.translationY = ay - cy; b.alpha = 0f; b.scaleX = 0.3f; b.scaleY = 0.3f
-                b.animate().translationX(0f).translationY(0f).alpha(1f).scaleX(1f).scaleY(1f).setDuration(180).start()
+        for ((rad, n) in rings) for (k in 0 until n) {
+            if (idx >= fanItems.size) break
+            val i = idx++
+            val th = Math.toRadians(if (n == 5) 90.0 + k * 45.0 else 100.0 + k * 32.0)
+            val dx = (Math.cos(th) * rad).toFloat() * (if (leftDir) 1f else -1f)
+            val dy = (-Math.sin(th) * rad).toFloat()
+            val cx = (ax + dx).coerceIn(sz / 2f + dp(4), root.width - sz / 2f - dp(4))
+            val cy = (ay + dy).coerceIn(sz / 2f + dp(40), root.height - sz / 2f - dp(8))
+            val b = mkFanBtn(10.5f)
+            b.setOnClickListener {
+                val fi = fanItems[i]
+                if (fi.opts().isNotEmpty()) { if (subOf == i) closeSub() else openSub(i) }
+                else { fi.act?.invoke(); refreshFan() }
             }
+            styleBtn(b, false, false, false)
+            fan.addView(b, FrameLayout.LayoutParams(sz, sz).apply { leftMargin = (cx - sz / 2f).toInt(); topMargin = (cy - sz / 2f).toInt() })
+            fanViews += b; fanPos += PointF(cx, cy)
+            b.translationX = ax - cx; b.translationY = ay - cy; b.alpha = 0f; b.scaleX = 0.3f; b.scaleY = 0.3f
+            b.animate().translationX(0f).translationY(0f).alpha(1f).scaleX(1f).scaleY(1f).setDuration(180).start()
         }
         fan.visibility = View.VISIBLE
         refreshFan()
+    }
+
+    /** 在某个图标外侧再弹出它的选项（下一层） */
+    private fun openSub(i: Int) {
+        closeSub()
+        val fi = fanItems[i]
+        val opts = fi.opts()
+        if (opts.isEmpty()) { fi.act?.invoke(); refreshFan(); return }
+        subOf = i
+        val p = fanPos[i]
+        val phi = Math.atan2((-(p.y - fanAy)).toDouble(), (p.x - fanAx).toDouble())
+        val sz = dp(56); val rad = dp(92).toFloat()
+        val n = opts.size
+        val cur = fi.state()
+        for ((k, op) in opts.withIndex()) {
+            val th = phi + (k - (n - 1) / 2.0) * Math.toRadians(40.0)
+            val cx = (p.x + (Math.cos(th) * rad).toFloat()).coerceIn(sz / 2f + dp(4), root.width - sz / 2f - dp(4))
+            val cy = (p.y - (Math.sin(th) * rad).toFloat()).coerceIn(sz / 2f + dp(40), root.height - sz / 2f - dp(8))
+            val b = mkFanBtn(11f)
+            b.text = op.first
+            b.setOnClickListener { op.second(); closeFan() }
+            styleBtn(b, false, op.first == cur, false)
+            fan.addView(b, FrameLayout.LayoutParams(sz, sz).apply { leftMargin = (cx - sz / 2f).toInt(); topMargin = (cy - sz / 2f).toInt() })
+            subViews += b; subPos += PointF(cx, cy); subOpts += op
+            b.translationX = p.x - cx; b.translationY = p.y - cy; b.alpha = 0f; b.scaleX = 0.3f; b.scaleY = 0.3f
+            b.animate().translationX(0f).translationY(0f).alpha(1f).scaleX(1f).scaleY(1f).setDuration(150).start()
+        }
+        restyleMain()
+    }
+
+    private fun closeSub() {
+        subViews.forEach { fan.removeView(it) }
+        subViews.clear(); subPos.clear(); subOpts.clear()
+        subOf = -1; hoverSub = -1
+        if (fanViews.isNotEmpty()) restyleMain()
+    }
+
+    private fun restyleMain() {
+        for ((i, b) in fanViews.withIndex()) styleBtn(b, i == hoverMain, i == subOf, subOf >= 0 && i != subOf && i != hoverMain)
+    }
+
+    private fun restyleSub() {
+        val cur = if (subOf >= 0) fanItems[subOf].state() else ""
+        for ((k, b) in subViews.withIndex()) styleBtn(b, k == hoverSub, subOpts[k].first == cur, false)
+    }
+
+    private fun hitTest(x: Float, y: Float): Pair<Boolean, Int>? {
+        val rs = dp(34).toFloat(); val rm = dp(37).toFloat()
+        for (k in subPos.indices) if (hypot(x - subPos[k].x, y - subPos[k].y) < rs) return Pair(true, k)
+        for (i in fanPos.indices) if (hypot(x - fanPos[i].x, y - fanPos[i].y) < rm) return Pair(false, i)
+        return null
+    }
+
+    /** 手指不抬起的滑动选择：移到图标上高亮，放手即设置；悬停约0.45秒展开下一层 */
+    private fun fanTouch(rx: Float, ry: Float, action: Int) {
+        val loc = IntArray(2); root.getLocationOnScreen(loc)
+        val hit = hitTest(rx - loc[0], ry - loc[1])
+        if (action == MotionEvent.ACTION_CANCEL) { fanDragging = false; return }
+        if (action == MotionEvent.ACTION_UP) {
+            fanDragging = false
+            ui.removeCallbacks(dwell)
+            if (hit == null) return                       // 空白处放手：菜单保持打开，可以再点
+            if (hit.first) { subOpts[hit.second].second(); closeFan() }
+            else {
+                val fi = fanItems[hit.second]
+                if (fi.opts().isNotEmpty()) openSub(hit.second) else { fi.act?.invoke(); closeFan() }
+            }
+            return
+        }
+        val nm = if (hit != null && !hit.first) hit.second else -1
+        val ns = if (hit != null && hit.first) hit.second else -1
+        if (nm != hoverMain) {
+            hoverMain = nm
+            ui.removeCallbacks(dwell)
+            if (nm >= 0) { root.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK); ui.postDelayed(dwell, 450) }
+            restyleMain()
+        }
+        if (ns != hoverSub) {
+            hoverSub = ns
+            if (ns >= 0) root.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            restyleSub()
+        }
     }
 
     private fun refreshFan() {
@@ -418,7 +559,13 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    private fun closeFan() { fan.visibility = View.GONE; fan.removeAllViews(); fanViews.clear() }
+    private fun closeFan() {
+        ui.removeCallbacks(dwell)
+        fan.visibility = View.GONE
+        fan.removeAllViews()
+        fanViews.clear(); fanPos.clear(); subViews.clear(); subPos.clear(); subOpts.clear()
+        subOf = -1; hoverMain = -1; hoverSub = -1; fanDragging = false
+    }
 
     private fun touchExp() {
         if (expPanel.visibility == View.VISIBLE) { ui.removeCallbacks(hidePanel); ui.postDelayed(hidePanel, 8000) }
@@ -458,21 +605,6 @@ class MainActivity : Activity(), SensorEventListener {
         isoRow.visibility = if (ex.mode >= 1) View.VISIBLE else View.GONE
         isoBar.isEnabled = ex.mode == 2
         updLabels()
-    }
-
-    private fun cycleExpMode() {
-        val cam = cams.firstOrNull()
-        val manual = curChars()?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-            ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
-        if (!manual) { toast("本机相机不开放手动ISO/快门，只能使用自动曝光"); return }
-        val n = (ex.mode + 1) % 3
-        if (ex.mode == 0) { // 从自动切到手动系：沿用当前实际曝光作为起点
-            cam?.resIso?.let { ex.iso = it }
-            cam?.resExp?.let { if (it > 0) ex.shutterDen = SHUTTERS[nearestShutter((1e9 / it).toInt())] }
-        }
-        ex.mode = n; ex.off = 0f
-        cam?.applyExposure(); refreshSliders(); refreshUi()
-        showExp()
     }
 
     // ===================== 曝光自动化（舞台强光/激光） =====================
@@ -526,21 +658,41 @@ class MainActivity : Activity(), SensorEventListener {
 
     // ===================== 控制逻辑 =====================
     private fun buildPresets() {
-        presetBar.removeAllViews()
-        val r = curChars()?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) ?: return
-        val list = (listOf(r.lower).filter { it < 0.9f } + listOf(1f, 2f, 3f, 5f)).filter { it <= r.upper }
-        for (z in list) {
-            val b = chip("%.1fx".format(z).replace(".0x", "x")) { cams.firstOrNull()?.preset(z) }
-            presetBar.addView(b, LinearLayout.LayoutParams(dp(60), dp(36)).apply { setMargins(0, dp(3), 0, dp(3)) })
-        }
+        val r = curChars()?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        if (r == null) { zoomRail.marks = listOf(1f); zoomRail.visibility = View.GONE; return }
+        val list = (listOf(r.lower).filter { it < 0.9f } + listOf(1f, 2f, 3f, 5f, 10f)).filter { it <= r.upper }
+        zoomRail.marks = list
+        zoomRail.visibility = if (list.size >= 2) View.VISIBLE else View.GONE
     }
 
-    private fun cycleStab() {
+    private fun setStab(m: Int) {
         if (recording) { toast("请先停止录制"); return }
-        val modes = curChars()?.let { Cam.stabModes(it) } ?: return
-        stab = modes[(modes.indexOf(stab) + 1) % modes.size]
-        if (stab >= 2) toast("电子防抖会裁切画面(视角变窄)，但手持更稳")
+        stab = m
+        if (m >= 2) toast("电子防抖会裁切画面(视角变窄)，但手持更稳")
         rebuild()
+    }
+
+    private fun setRes(b: Boolean) { if (recording) { toast("请先停止录制"); return }; res4k = b; rebuild() }
+
+    private fun setLens(i: Int) {
+        if (recording) { toast("请先停止录制"); return }
+        lensIdx = i
+        if (mode == 1) mode = 0
+        rebuild()
+    }
+
+    private fun setExpMode(n: Int) {
+        val cam = cams.firstOrNull()
+        val manual = curChars()?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        if (n >= 1 && !manual) { toast("本机相机不开放手动ISO/快门，只能使用自动曝光"); return }
+        if (ex.mode == 0 && n >= 1) {   // 从自动切到手动系：沿用当前实际曝光作为起点
+            cam?.resIso?.let { ex.iso = it }
+            cam?.resExp?.let { if (it > 0) ex.shutterDen = SHUTTERS[nearestShutter((1e9 / it).toInt())] }
+        }
+        ex.mode = n; ex.off = 0f
+        cam?.applyExposure(); refreshSliders(); refreshUi()
+        showExp()
     }
 
     private fun dualOk(): Boolean {
@@ -555,14 +707,6 @@ class MainActivity : Activity(), SensorEventListener {
         if (n == 1 && frontId == null) n = 2
         if (n == 2 && !dualOk()) { toast("本机系统不支持前后摄同时开启"); n = 0 }
         mode = n
-        rebuild()
-    }
-
-    private fun cycleLens() {
-        if (recording) { toast("请先停止录制"); return }
-        if (lenses.size <= 1) { toast("本机只开放了一个系统镜头，请用 0.6x/1x/3x 按钮切换镜头（会自动锁住不乱切）"); return }
-        lensIdx = (lensIdx + 1) % lenses.size
-        if (mode == 1) mode = 0
         rebuild()
     }
 
@@ -696,6 +840,7 @@ class MainActivity : Activity(), SensorEventListener {
             t += "\n● REC %02d:%02d".format(s / 60, s % 60)
         }
         status.text = t
+        zoomRail.zoom = cam?.zoom ?: 1f; zoomRail.invalidate()
         if (ex.mode == 1) { isoLabel.text = "ISO ${ex.iso}(自动)"; cam?.isoRange?.let { isoBar.progress = isoToProg(ex.iso, it.lower, it.upper) } }
         refreshUi()
     }
