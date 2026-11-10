@@ -35,6 +35,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -77,17 +78,12 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var isoBar: SeekBar
     private lateinit var bRec: Button
     private lateinit var bMode: Button
-    private lateinit var bExpo: Button
-    private lateinit var bLens: Button
-    private lateinit var bRes: Button
-    private lateinit var bStab: Button
-    private lateinit var bAuto: Button
-    private lateinit var bLock: Button
-    private lateinit var bExpMode: Button
-    private lateinit var bProt: Button
-    private lateinit var bSpot: Button
-    private lateinit var bAeLock: Button
-    private lateinit var bDiag: Button
+    private lateinit var bGear: Button
+    private lateinit var fan: FrameLayout
+    private class FanItem(val title: String, val state: () -> String, val act: () -> Unit)
+    private val fanItems = mutableListOf<FanItem>()
+    private val fanViews = mutableListOf<Button>()
+    private val hidePanel = Runnable { expPanel.visibility = View.GONE }
 
     private val ui = Handler(Looper.getMainLooper())
     private val cams = mutableListOf<Cam>()
@@ -208,7 +204,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun sRow(l: TextView, b: SeekBar) = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-        addView(l, LinearLayout.LayoutParams(dp(130), -2))
+        addView(l, LinearLayout.LayoutParams(dp(104), -2))
         addView(b, LinearLayout.LayoutParams(0, -2, 1f))
     }
 
@@ -256,48 +252,50 @@ class MainActivity : Activity(), SensorEventListener {
             if (ex.mode == 2) { ex.iso = progToIso(p, ir.lower, ir.upper); cams.firstOrNull()?.applyExposure(); updLabels() }
         }
 
-        // ---- 主操作行 ----
-        presetBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        // ---- 右侧操作条（单手拇指区） ----
+        presetBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
         bRec = Button(this).apply {
-            textSize = 24f; setTextColor(Color.WHITE)
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.rgb(220, 40, 40)) }
+            textSize = 26f; setTextColor(Color.WHITE)
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.rgb(220, 40, 40)); setStroke(dp(3), Color.WHITE) }
             setOnClickListener { toggleRec() }
         }
         bMode = chip { cycleMode() }
-        bExpo = chip("曝光▲") { expPanel.visibility = if (expPanel.visibility == View.GONE) View.VISIBLE else View.GONE }
-        val action = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER
-            addView(bMode, LinearLayout.LayoutParams(dp(96), dp(44)))
-            addView(bRec, LinearLayout.LayoutParams(dp(72), dp(72)).apply { setMargins(dp(20), dp(4), dp(20), dp(4)) })
-            addView(bExpo, LinearLayout.LayoutParams(dp(96), dp(44)))
+        bGear = chip("⚙ 设置") { openFanAtView(bGear) }
+        val rail = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(4), dp(8), dp(4), dp(8))
+            addView(presetBar)
+            addView(bRec, LinearLayout.LayoutParams(dp(76), dp(76)).apply { setMargins(0, dp(14), 0, dp(14)) })
+            addView(bMode, LinearLayout.LayoutParams(dp(72), dp(40)))
+            addView(bGear, LinearLayout.LayoutParams(dp(72), dp(40)).apply { topMargin = dp(8) })
         }
+        root.addView(ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(rail) },
+            FrameLayout.LayoutParams(dp(84), -2, Gravity.END or Gravity.CENTER_VERTICAL))
 
-        // ---- 设置条(可横向滑动) ----
-        bLens = chip { cycleLens() }
-        bRes = chip { if (!recording) { res4k = !res4k; rebuild() } else toast("请先停止录制") }
-        bStab = chip { cycleStab() }
-        bAuto = chip { auto = !auto; resetGyro(); refreshUi() }
-        bLock = chip { cams.firstOrNull()?.let { it.setLock(!it.locked); resetGyro() } }
-        bExpMode = chip { cycleExpMode() }
-        bProt = chip { ex.protect = !ex.protect; ex.off = 0f; cams.firstOrNull()?.applyExposure(); refreshUi() }
-        bSpot = chip { ex.spot = !ex.spot; cams.firstOrNull()?.applyExposure(); refreshUi() }
-        bAeLock = chip { ex.lockAe = !ex.lockAe; refreshUi() }
-        bDiag = chip("诊断信息") { showDiag() }
-        val chips = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            listOf(bLens, bRes, bStab, bAuto, bLock, bExpMode, bProt, bSpot, bAeLock, bDiag).forEach {
-                addView(it, LinearLayout.LayoutParams(-2, dp(36)).apply { rightMargin = dp(6) })
-            }
-        }
-        val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(chips) }
+        // 曝光滑杆面板：在操作条左边，拇指够得着，8秒无操作自动收起
+        expPanel.background = bg(Color.argb(180, 0, 0, 0), 14)
+        expPanel.setPadding(dp(10), dp(8), dp(10), dp(8))
+        root.addView(expPanel, FrameLayout.LayoutParams(dp(300), -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(88) })
 
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; isClickable = true
-            setBackgroundColor(Color.argb(120, 0, 0, 0))
-            setPadding(dp(8), dp(6), dp(8), dp(10))
-            addView(expPanel); addView(presetBar); addView(action); addView(scroll)
+        // ---- 扇形菜单项 ----
+        fanItems += FanItem("镜头", { lenses.getOrNull(lensIdx)?.label?.substringBefore(" (") ?: "无" }) { cycleLens() }
+        fanItems += FanItem("画质", { if (res4k) "4K" else "1080p" }) { if (!recording) { res4k = !res4k; rebuild() } else toast("请先停止录制") }
+        fanItems += FanItem("防抖", { listOf("关", "光学", "光学+电", "增强")[stab.coerceIn(0, 3)] }) { cycleStab() }
+        fanItems += FanItem("曝光", { listOf("自动", "快门优先", "手动")[ex.mode] }) { cycleExpMode() }
+        fanItems += FanItem("滑杆", { if (expPanel.visibility == View.VISIBLE) "开" else "关" }) {
+            if (expPanel.visibility == View.VISIBLE) expPanel.visibility = View.GONE else showExp()
         }
-        root.addView(panel, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        fanItems += FanItem("高光保护", { if (ex.protect) "开" else "关" }) { ex.protect = !ex.protect; ex.off = 0f; cams.firstOrNull()?.applyExposure() }
+        fanItems += FanItem("测光", { if (ex.spot) "点击处" else "全局" }) { ex.spot = !ex.spot; cams.firstOrNull()?.applyExposure() }
+        fanItems += FanItem("手动锁焦", { if (cams.firstOrNull()?.locked == true) "已锁" else "未锁" }) { cams.firstOrNull()?.let { it.setLock(!it.locked); resetGyro() } }
+        fanItems += FanItem("自动锁焦", { if (auto) "开" else "关" }) { auto = !auto; resetGyro() }
+        fanItems += FanItem("锁曝光", { if (ex.lockAe) "开" else "关" }) { ex.lockAe = !ex.lockAe }
+        fanItems += FanItem("诊断", { "" }) { closeFan(); showDiag() }
+        fan = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(90, 0, 0, 0)); isClickable = true; visibility = View.GONE
+            setOnClickListener { closeFan() }
+        }
+        root.addView(fan, FrameLayout.LayoutParams(-1, -1))
 
         // ---- 手势：双指缩放 + 单击对焦/测光 ----
         val sd = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -307,6 +305,8 @@ class MainActivity : Activity(), SensorEventListener {
             }
         })
         val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onLongPress(e: MotionEvent) { openFan(e.x, e.y) }
+
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 val u = (e.x - mainTv.x) / mainTv.width
                 val v = (e.y - mainTv.y) / mainTv.height
@@ -343,7 +343,7 @@ class MainActivity : Activity(), SensorEventListener {
         else { tw = w; th = w * 9 / 16; if (th > hh) { th = hh; tw = th * 16 / 9 } }
         if (tw != lw || th != lh || portrait != lPortrait) {
             lw = tw; lh = th; lPortrait = portrait
-            mainTv.layoutParams = FrameLayout.LayoutParams(tw, th, if (portrait) Gravity.TOP or Gravity.CENTER_HORIZONTAL else Gravity.CENTER)
+            mainTv.layoutParams = FrameLayout.LayoutParams(tw, th, Gravity.CENTER)
             (pipTv.layoutParams as FrameLayout.LayoutParams).apply {
                 width = if (portrait) dp(90) else dp(200); height = if (portrait) dp(160) else dp(113)
                 pipTv.layoutParams = this
@@ -363,16 +363,68 @@ class MainActivity : Activity(), SensorEventListener {
     private fun refreshUi() {
         bRec.text = if (recording) "■" else "●"
         bMode.text = listOf("后置", "前置", "前后同录")[mode]
-        bLens.text = lenses.getOrNull(lensIdx)?.label ?: "无后置镜头"
-        bRes.text = if (res4k) "4K" else "1080p"
-        bStab.text = stabName()
-        bAuto.text = if (auto) "自动锁焦:开" else "自动锁焦:关"
-        bLock.text = if (cams.firstOrNull()?.locked == true) "解锁对焦" else "手动锁焦"
-        bExpMode.text = "曝光:" + listOf("自动", "快门优先", "手动")[ex.mode]
-        bProt.text = if (ex.protect) "高光保护:开" else "高光保护:关"
-        bSpot.text = if (ex.spot) "测光:点击处" else "测光:全局"
-        bAeLock.text = if (ex.lockAe) "锁焦时锁曝光:开" else "锁焦时锁曝光:关"
+        if (fan.visibility == View.VISIBLE) refreshFan()
     }
+
+    // ===================== 扇形菜单 =====================
+    private fun openFanAtView(v: View) {
+        val a = IntArray(2); val r = IntArray(2)
+        v.getLocationInWindow(a); root.getLocationInWindow(r)
+        openFan(a[0] - r[0] + v.width / 2f, a[1] - r[1] + v.height / 2f)
+    }
+
+    /** 以(ax,ay)为圆心向屏幕内侧弹出两圈半圆扇形 */
+    private fun openFan(ax: Float, ay: Float) {
+        fan.removeAllViews(); fanViews.clear()
+        val leftDir = ax > root.width / 2f
+        val sz = dp(62)
+        val rings = listOf(Pair(dp(100).toFloat(), 5), Pair(dp(178).toFloat(), 6))
+        var idx = 0
+        for ((rad, n) in rings) {
+            for (k in 0 until n) {
+                if (idx >= fanItems.size) break
+                val item = fanItems[idx++]
+                val deg = if (n == 5) 90.0 + k * 45.0 else 100.0 + k * 32.0
+                val th = Math.toRadians(deg)
+                val dx = (Math.cos(th) * rad).toFloat() * (if (leftDir) 1f else -1f)
+                val dy = (-Math.sin(th) * rad).toFloat()
+                val cx = (ax + dx).coerceIn(sz / 2f + dp(4), root.width - sz / 2f - dp(4))
+                val cy = (ay + dy).coerceIn(sz / 2f + dp(40), root.height - sz / 2f - dp(8))
+                val b = Button(this).apply {
+                    isAllCaps = false; textSize = 10.5f; setTextColor(Color.WHITE)
+                    setPadding(0, 0, 0, 0); minWidth = 0; minHeight = 0; minimumWidth = 0; minimumHeight = 0
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL; setColor(Color.argb(225, 30, 30, 30)); setStroke(dp(1), Color.WHITE)
+                    }
+                    setOnClickListener { item.act(); refreshFan() }
+                }
+                val lp = FrameLayout.LayoutParams(sz, sz).apply {
+                    leftMargin = (cx - sz / 2f).toInt(); topMargin = (cy - sz / 2f).toInt()
+                }
+                fan.addView(b, lp); fanViews += b
+                b.translationX = ax - cx; b.translationY = ay - cy; b.alpha = 0f; b.scaleX = 0.3f; b.scaleY = 0.3f
+                b.animate().translationX(0f).translationY(0f).alpha(1f).scaleX(1f).scaleY(1f).setDuration(180).start()
+            }
+        }
+        fan.visibility = View.VISIBLE
+        refreshFan()
+    }
+
+    private fun refreshFan() {
+        for ((i, b) in fanViews.withIndex()) {
+            val fi = fanItems[i]
+            val st = fi.state()
+            b.text = if (st.isEmpty()) fi.title else fi.title + "\n" + st
+        }
+    }
+
+    private fun closeFan() { fan.visibility = View.GONE; fan.removeAllViews(); fanViews.clear() }
+
+    private fun touchExp() {
+        if (expPanel.visibility == View.VISIBLE) { ui.removeCallbacks(hidePanel); ui.postDelayed(hidePanel, 8000) }
+    }
+
+    private fun showExp() { expPanel.visibility = View.VISIBLE; touchExp() }
 
     private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_LONG).show() }
 
@@ -387,7 +439,8 @@ class MainActivity : Activity(), SensorEventListener {
     private fun progToIso(p: Int, lo: Int, hi: Int) = (lo * (hi.toFloat() / lo).pow(p / 100f)).toInt()
 
     private fun updLabels() {
-        evLabel.text = "曝光补偿 %+.1f EV".format(ex.ev)
+        evLabel.text = "曝光 %+.1f EV".format(ex.ev)
+        touchExp()
         shLabel.text = "快门 1/${ex.shutterDen}"
         isoLabel.text = "ISO ${ex.iso}" + if (ex.mode == 1) "(自动)" else ""
     }
@@ -419,7 +472,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         ex.mode = n; ex.off = 0f
         cam?.applyExposure(); refreshSliders(); refreshUi()
-        expPanel.visibility = View.VISIBLE
+        showExp()
     }
 
     // ===================== 曝光自动化（舞台强光/激光） =====================
@@ -478,7 +531,7 @@ class MainActivity : Activity(), SensorEventListener {
         val list = (listOf(r.lower).filter { it < 0.9f } + listOf(1f, 2f, 3f, 5f)).filter { it <= r.upper }
         for (z in list) {
             val b = chip("%.1fx".format(z).replace(".0x", "x")) { cams.firstOrNull()?.preset(z) }
-            presetBar.addView(b, LinearLayout.LayoutParams(dp(56), dp(34)).apply { setMargins(dp(3), dp(2), dp(3), dp(2)) })
+            presetBar.addView(b, LinearLayout.LayoutParams(dp(60), dp(36)).apply { setMargins(0, dp(3), 0, dp(3)) })
         }
     }
 
