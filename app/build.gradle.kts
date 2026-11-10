@@ -9,8 +9,19 @@ android {
         applicationId = "com.concertcam"
         minSdk = 30
         targetSdk = 34
-        versionCode = 1
+        versionCode = (project.findProperty("vc") as String?)?.toInt() ?: 1
         versionName = "1.0"
+    }
+    signingConfigs {
+        create("fixed") {
+            storeFile = file("concertcam.jks")
+            storePassword = "concertcam"
+            keyAlias = "concertcam"
+            keyPassword = "concertcam"
+        }
+    }
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("fixed") }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
