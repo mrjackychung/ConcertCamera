@@ -10,6 +10,7 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PointF
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -41,10 +42,12 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.ln
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 class MainActivity : Activity(), SensorEventListener {
@@ -65,7 +68,17 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var root: FrameLayout
     private lateinit var mainTv: TextureView
     private lateinit var pipTv: TextureView
-    private lateinit var status: TextView
+    private lateinit var lensBadge: TextView
+    private lateinit var recPill: TextView
+    private lateinit var afPill: TextView
+    private lateinit var expPill: TextView
+    private lateinit var lockBox: FrameLayout
+    private lateinit var expHead: TextView
+    private lateinit var expNote: TextView
+    private lateinit var bAutoExp: Button
+    private var lastLensName = ""
+    private var dragging = false
+    private val lensInfo = mutableMapOf<String, Pair<String, Float>>()
     private lateinit var ring: View
     private lateinit var zoomRail: ZoomRail
     private lateinit var expPanel: LinearLayout
@@ -145,6 +158,9 @@ class MainActivity : Activity(), SensorEventListener {
             ?.getOutputSizes(MediaRecorder::class.java)?.isNotEmpty() == true
     }
 
+    private fun lensName(r: Float) = if (r < 0.8f) "超广角" else if (r < 1.6f) "主摄" else "长焦"
+    private fun fmtX(v: Float) = if (abs(v - v.roundToInt()) < 0.05f) "${v.roundToInt()}x" else "%.1fx".format(v)
+
     private fun lensLabel(eq: Int, ref: Int, tag: String): Pair<String, Float> {
         val r = if (eq == 0 || ref == 0) 1f else eq.toFloat() / ref
         val name = if (r < 0.8f) "超广角" else if (r < 1.6f) "主摄" else "长焦"
@@ -167,6 +183,14 @@ class MainActivity : Activity(), SensorEventListener {
         }
         val physSet = backs.flatMap { chars(it).physicalCameraIds }.toSet()
         val ref = backs.firstOrNull { it !in physSet }?.let { eqMm(chars(it)) } ?: 0
+        fun ratio(e: Int) = if (e == 0 || ref == 0) 1f else e.toFloat() / ref
+        for (id in backs) {
+            val r0 = ratio(eqMm(chars(id)))
+            lensInfo[id] = lensName(r0) to r0
+            for (pp in chars(id).physicalCameraIds) try {
+                val r1 = ratio(eqMm(chars(pp))); lensInfo[pp] = lensName(r1) to r1
+            } catch (_: Exception) {}
+        }
         for (id in backs) {
             if (id in physSet) continue
             val c = chars(id)
@@ -215,9 +239,9 @@ class MainActivity : Activity(), SensorEventListener {
     private fun label() = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f }
 
     private fun onBar(bar: SeekBar, f: (Int) -> Unit) = bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-        override fun onProgressChanged(s: SeekBar, p: Int, user: Boolean) { if (user) f(p) }
-        override fun onStartTrackingTouch(s: SeekBar) {}
-        override fun onStopTrackingTouch(s: SeekBar) {}
+        override fun onProgressChanged(s: SeekBar, p: Int, user: Boolean) { if (user) { touchExp(); f(p) } }
+        override fun onStartTrackingTouch(s: SeekBar) { dragging = true }
+        override fun onStopTrackingTouch(s: SeekBar) { dragging = false }
     })
 
     private fun buildUi() {
@@ -228,8 +252,29 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(pipTv, FrameLayout.LayoutParams(dp(90), dp(160), Gravity.TOP or Gravity.END).apply {
             setMargins(0, dp(40), dp(10), 0)
         })
-        status = TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f; setShadowLayer(4f, 0f, 0f, Color.BLACK) }
-        root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { setMargins(dp(12), dp(36), 0, 0) })
+        fun pill(sp: Float, bold: Boolean = false) = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = sp
+            background = bg(Color.argb(150, 0, 0, 0), 14)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            if (bold) typeface = Typeface.DEFAULT_BOLD
+        }
+        lensBadge = pill(20f, true)       // 当前镜头：最醒目
+        root.addView(lensBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(34) })
+        recPill = pill(13f, true).apply { setTextColor(Color.rgb(255, 90, 90)); visibility = View.GONE }
+        afPill = pill(12f)
+        expPill = pill(12f).apply { setOnClickListener { togglePanel() } }   // 点它展开曝光滑杆
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            listOf(recPill, afPill, expPill).forEach { addView(it, LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(4) }) }
+        }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { setMargins(dp(10), dp(34), 0, 0) })
+        // 对焦锁定框（类似苹果的黄框）：锁定时显示在对焦点
+        lockBox = FrameLayout(this).apply {
+            background = GradientDrawable().apply { setStroke(dp(2), Color.YELLOW); setColor(Color.TRANSPARENT) }
+            visibility = View.GONE
+            addView(TextView(this@MainActivity).apply { text = "🔒 锁定"; setTextColor(Color.YELLOW); textSize = 11f },
+                FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+        }
+        root.addView(lockBox, FrameLayout.LayoutParams(dp(76), dp(76)))
         ring = View(this).apply {
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setStroke(dp(2), Color.YELLOW); setColor(Color.TRANSPARENT) }
             visibility = View.GONE
@@ -240,20 +285,42 @@ class MainActivity : Activity(), SensorEventListener {
         evLabel = label(); shLabel = label(); isoLabel = label()
         evBar = SeekBar(this); shBar = SeekBar(this); isoBar = SeekBar(this).apply { max = 100 }
         evRow = sRow(evLabel, evBar); shRow = sRow(shLabel, shBar); isoRow = sRow(isoLabel, isoBar)
+        expHead = label().apply { textSize = 13f; typeface = Typeface.DEFAULT_BOLD }
+        bAutoExp = chip("恢复自动") { setExpMode(0) }
+        expNote = label().apply {
+            setTextColor(Color.rgb(255, 190, 120)); visibility = View.GONE
+            text = "本机相机不开放手动 ISO / 快门（系统限制），只能调曝光补偿"
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(expHead, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(bAutoExp, LinearLayout.LayoutParams(-2, dp(30)))
+        }
         expPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; visibility = View.GONE
-            addView(evRow); addView(shRow); addView(isoRow)
+            addView(head); addView(evRow); addView(shRow); addView(isoRow); addView(expNote)
         }
+        // 拖哪一项就切到对应的控制方式：拖EV=自动曝光；拖快门=快门优先；拖ISO=手动
         onBar(evBar) { p ->
             val c = curChars() ?: return@onBar
             val r = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: return@onBar
+            if (ex.mode == 2) ex.mode = 0
             ex.ev = (r.lower + p) * Cam.evStep(c); ex.off = 0f
-            cams.firstOrNull()?.applyExposure(); updLabels()
+            applyExp(); updRows()
         }
-        onBar(shBar) { p -> ex.shutterDen = SHUTTERS[p]; cams.firstOrNull()?.applyExposure(); updLabels() }
+        onBar(shBar) { p ->
+            if (cams.firstOrNull()?.manualOk != true) return@onBar
+            if (ex.mode == 0) { seedFromActual(); ex.mode = 1 }
+            ex.shutterDen = SHUTTERS[p]
+            applyExp(); updRows()
+        }
         onBar(isoBar) { p ->
             val ir = curChars()?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: return@onBar
-            if (ex.mode == 2) { ex.iso = progToIso(p, ir.lower, ir.upper); cams.firstOrNull()?.applyExposure(); updLabels() }
+            if (cams.firstOrNull()?.manualOk != true) return@onBar
+            if (ex.mode == 0) seedFromActual()
+            ex.mode = 2
+            ex.iso = progToIso(p, ir.lower, ir.upper)
+            applyExp(); updRows()
         }
 
         // ---- 右侧操作条（单手拇指区） ----
@@ -297,27 +364,18 @@ class MainActivity : Activity(), SensorEventListener {
         expPanel.setPadding(dp(10), dp(8), dp(10), dp(8))
         root.addView(expPanel, FrameLayout.LayoutParams(dp(300), -2, Gravity.END or Gravity.CENTER_VERTICAL).apply { rightMargin = dp(88) })
 
-        // ---- 扇形菜单项（有子选项的，悬停/点击会展开下一层） ----
-        fanItems += FanItem("镜头", { lenses.getOrNull(lensIdx)?.label?.substringBefore(" (") ?: "无" },
-            { if (lenses.size > 1) lenses.mapIndexed { i, l -> o(l.label.substringBefore(" (")) { setLens(i) } } else emptyList() },
-            { toast("本机只开放了一个系统镜头，请用右侧变焦条切换（会自动锁住不乱切）") })
+        // ---- 扇形菜单项（精简为5项；有子选项的，悬停/点击会展开下一层） ----
+        if (lenses.size > 1) fanItems += FanItem("镜头", { lenses.getOrNull(lensIdx)?.label?.substringBefore(" (") ?: "无" },
+            { lenses.mapIndexed { i, l -> o(l.label.substringBefore(" (")) { setLens(i) } } })
         fanItems += FanItem("画质", { if (res4k) "4K" else "1080p" }, { listOf(o("1080p") { setRes(false) }, o("4K") { setRes(true) }) })
         fanItems += FanItem("防抖", { stabNames[stab.coerceIn(0, 3)] },
             { (curChars()?.let { Cam.stabModes(it) } ?: listOf(0)).map { m -> o(stabNames[m]) { setStab(m) } } })
-        fanItems += FanItem("曝光", { expNames[ex.mode] }, { (0..2).map { n -> o(expNames[n]) { setExpMode(n) } } })
-        fanItems += FanItem("滑杆", { if (expPanel.visibility == View.VISIBLE) "开" else "关" },
-            act = { if (expPanel.visibility == View.VISIBLE) expPanel.visibility = View.GONE else showExp() })
-        fanItems += FanItem("高光保护", { if (ex.protect) "开" else "关" },
-            { listOf(o("开") { ex.protect = true; ex.off = 0f; applyExp() }, o("关") { ex.protect = false; ex.off = 0f; applyExp() }) })
-        fanItems += FanItem("测光", { if (ex.spot) "点击处" else "全局" },
-            { listOf(o("点击处") { ex.spot = true; applyExp() }, o("全局") { ex.spot = false; applyExp() }) })
-        fanItems += FanItem("手动锁焦", { if (cams.firstOrNull()?.locked == true) "已锁" else "未锁" },
-            { listOf(o("锁定") { cams.firstOrNull()?.setLock(true) }, o("解锁") { cams.firstOrNull()?.setLock(false); resetGyro() }) })
-        fanItems += FanItem("自动锁焦", { if (auto) "开" else "关" },
-            { listOf(o("开") { auto = true; resetGyro() }, o("关") { auto = false; resetGyro() }) })
-        fanItems += FanItem("锁曝光", { if (ex.lockAe) "开" else "关" },
-            { listOf(o("开") { ex.lockAe = true }, o("关") { ex.lockAe = false }) })
-        fanItems += FanItem("诊断", { "" }, act = { closeFan(); showDiag() })
+        fanItems += FanItem("曝光", { expNames[ex.mode] }, act = { togglePanel() })
+        fanItems += FanItem("锁焦", { if (cams.firstOrNull()?.locked == true) "锁定" else if (auto) "自动" else "关" },
+            { listOf(
+                o("自动") { auto = true; cams.firstOrNull()?.setLock(false); resetGyro() },
+                o("锁定") { cams.firstOrNull()?.setLock(true) },
+                o("关") { auto = false; cams.firstOrNull()?.setLock(false); resetGyro() }) })
         fan = FrameLayout(this).apply {
             setBackgroundColor(Color.argb(90, 0, 0, 0)); isClickable = true; visibility = View.GONE
             setOnClickListener { closeFan() }
@@ -443,12 +501,10 @@ class MainActivity : Activity(), SensorEventListener {
         fanAx = ax; fanAy = ay
         val leftDir = ax > root.width / 2f
         val sz = dp(62)
-        val rings = listOf(Pair(dp(100).toFloat(), 5), Pair(dp(178).toFloat(), 6))
-        var idx = 0
-        for ((rad, n) in rings) for (k in 0 until n) {
-            if (idx >= fanItems.size) break
-            val i = idx++
-            val th = Math.toRadians(if (n == 5) 90.0 + k * 45.0 else 100.0 + k * 32.0)
+        val rad = dp(110).toFloat()
+        val cnt = fanItems.size
+        for (i in 0 until cnt) {
+            val th = Math.toRadians(90.0 + i * 180.0 / maxOf(1, cnt - 1))
             val dx = (Math.cos(th) * rad).toFloat() * (if (leftDir) 1f else -1f)
             val dy = (-Math.sin(th) * rad).toFloat()
             val cx = (ax + dx).coerceIn(sz / 2f + dp(4), root.width - sz / 2f - dp(4))
@@ -571,7 +627,8 @@ class MainActivity : Activity(), SensorEventListener {
         if (expPanel.visibility == View.VISIBLE) { ui.removeCallbacks(hidePanel); ui.postDelayed(hidePanel, 8000) }
     }
 
-    private fun showExp() { expPanel.visibility = View.VISIBLE; touchExp() }
+    private fun showExp() { refreshSliders(); expPanel.visibility = View.VISIBLE; touchExp() }
+    private fun togglePanel() { if (expPanel.visibility == View.VISIBLE) expPanel.visibility = View.GONE else showExp() }
 
     private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_LONG).show() }
 
@@ -585,11 +642,31 @@ class MainActivity : Activity(), SensorEventListener {
     private fun isoToProg(iso: Int, lo: Int, hi: Int) = (100 * ln(iso.toFloat() / lo) / ln(hi.toFloat() / lo)).toInt().coerceIn(0, 100)
     private fun progToIso(p: Int, lo: Int, hi: Int) = (lo * (hi.toFloat() / lo).pow(p / 100f)).toInt()
 
-    private fun updLabels() {
-        evLabel.text = "曝光 %+.1f EV".format(ex.ev)
-        touchExp()
-        shLabel.text = "快门 1/${ex.shutterDen}"
-        isoLabel.text = "ISO ${ex.iso}" + if (ex.mode == 1) "(自动)" else ""
+    /** 用当前实际曝光作为手动的起点（避免画面突然变亮变暗） */
+    private fun seedFromActual() {
+        val cam = cams.firstOrNull()
+        cam?.resIso?.let { ex.iso = it }
+        cam?.resExp?.let { if (it > 0) ex.shutterDen = SHUTTERS[nearestShutter((1e9 / it).toInt())] }
+        shBar.progress = nearestShutter(ex.shutterDen)
+        cam?.isoRange?.let { isoBar.progress = isoToProg(ex.iso, it.lower, it.upper) }
+    }
+
+    private fun updRows() {
+        val cam = cams.firstOrNull()
+        val manual = cam?.manualOk ?: false
+        expHead.text = "曝光 · " + expNames[ex.mode]
+        bAutoExp.visibility = if (ex.mode != 0) View.VISIBLE else View.GONE
+        shRow.visibility = if (manual) View.VISIBLE else View.GONE
+        isoRow.visibility = if (manual) View.VISIBLE else View.GONE
+        expNote.visibility = if (manual) View.GONE else View.VISIBLE
+        evRow.alpha = if (ex.mode == 2) 0.45f else 1f
+        shRow.alpha = if (ex.mode == 0) 0.6f else 1f
+        isoRow.alpha = if (ex.mode == 2) 1f else 0.6f
+        val den = if (ex.mode == 0) (cam?.resExp?.let { if (it > 0) (1e9 / it).toInt() else null } ?: ex.shutterDen) else ex.shutterDen
+        val iso = if (ex.mode == 0) (cam?.resIso ?: ex.iso) else ex.iso
+        evLabel.text = "EV %+.1f".format(ex.ev)
+        shLabel.text = "快门 1/$den" + if (ex.mode == 0) " 自动" else ""
+        isoLabel.text = "ISO $iso" + if (ex.mode != 2) " 自动" else ""
     }
 
     private fun refreshSliders() {
@@ -600,11 +677,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         shBar.max = SHUTTERS.size - 1; shBar.progress = nearestShutter(ex.shutterDen)
         c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoBar.progress = isoToProg(ex.iso, it.lower, it.upper) }
-        evRow.visibility = if (ex.mode != 2) View.VISIBLE else View.GONE
-        shRow.visibility = if (ex.mode >= 1) View.VISIBLE else View.GONE
-        isoRow.visibility = if (ex.mode >= 1) View.VISIBLE else View.GONE
-        isoBar.isEnabled = ex.mode == 2
-        updLabels()
+        updRows()
     }
 
     // ===================== 曝光自动化（舞台强光/激光） =====================
@@ -683,16 +756,10 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun setExpMode(n: Int) {
         val cam = cams.firstOrNull()
-        val manual = curChars()?.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-            ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
-        if (n >= 1 && !manual) { toast("本机相机不开放手动ISO/快门，只能使用自动曝光"); return }
-        if (ex.mode == 0 && n >= 1) {   // 从自动切到手动系：沿用当前实际曝光作为起点
-            cam?.resIso?.let { ex.iso = it }
-            cam?.resExp?.let { if (it > 0) ex.shutterDen = SHUTTERS[nearestShutter((1e9 / it).toInt())] }
-        }
+        if (n >= 1 && cam?.manualOk != true) { toast("本机相机不开放手动ISO/快门（系统限制）"); return }
+        if (ex.mode == 0 && n >= 1) seedFromActual()
         ex.mode = n; ex.off = 0f
         cam?.applyExposure(); refreshSliders(); refreshUi()
-        showExp()
     }
 
     private fun dualOk(): Boolean {
@@ -767,30 +834,6 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    private fun showDiag() {
-        val txt = buildString {
-            appendLine("Android ${Build.VERSION.SDK_INT}  ${Build.MODEL}")
-            for (id in allIds) {
-                val c = chars(id)
-                appendLine("ID$id${if (id !in cm.cameraIdList) "(隐藏)" else ""} 朝向=${c.get(CameraCharacteristics.LENS_FACING)} ${eqMm(c)}mm 可录像=${valid(c)} " +
-                    "缩放=${c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)} 防抖=${Cam.stabModes(c)} " +
-                    "ISO=${c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)} EV=${c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)}")
-                for (p in c.physicalCameraIds) {
-                    try { appendLine("   └物理$p ${eqMm(chars(p))}mm") } catch (_: Exception) { appendLine("   └物理$p 无法读取") }
-                }
-            }
-            appendLine("可同时开启: " + try { cm.concurrentCameraIds.toString() } catch (_: Exception) { "无" })
-            lenses.forEach { appendLine("镜头项: ${it.label} open=${it.openId} phys=${it.phys}") }
-            appendLine("当前: ${lenses.getOrNull(lensIdx)?.label}")
-            appendLine("系统实际使用的物理镜头ID: ${cams.firstOrNull()?.activeId}")
-            appendLine("最近错误: $lastErr")
-        }
-        AlertDialog.Builder(this).setTitle("诊断信息").setMessage(txt)
-            .setPositiveButton("复制") { _, _ ->
-                (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("diag", txt))
-            }.setNegativeButton("关闭", null).show()
-    }
-
     // ===================== 陀螺仪：自动锁焦 / 自动解锁 =====================
     private fun resetGyro() {
         stableMs = 0f; settleMs = 0f; moved = false; vx = 0f; vy = 0f; vz = 0f
@@ -824,24 +867,64 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun tick() {
         val cam = cams.firstOrNull()
-        val af = when {
-            cam == null -> ""
-            cam.locked -> "🔒 焦距已锁定" + if (moved) "（换目标，稳定后重新对焦）" else "（点屏幕可重新对焦）"
-            auto -> "对焦中 稳定 %.1f/%.0fs（点屏幕指定对焦点）".format(stableMs / 1000f, LOCK_AFTER_MS / 1000f)
-            else -> "自动对焦（自动锁焦已关）"
+        // ---- 当前镜头（醒目）：优先用系统实际在用的物理镜头 ----
+        if (cam == null) lensBadge.visibility = View.GONE
+        else {
+            val key = cam.activeId ?: lenses.getOrNull(lensIdx)?.let { it.phys ?: it.openId }
+            val info = key?.let { lensInfo[it] }
+            val name = if (mode == 1) "前置" else info?.first ?: "镜头"
+            val r = if (mode == 1) 1f else info?.second ?: 1f
+            val z = cam.zoom
+            lensBadge.text = name + " " + fmtX(r) + if (z >= r * 1.1f && mode != 1) "  ➜  " + fmtX(z) else ""
+            lensBadge.setTextColor(when (name) {
+                "超广角" -> Color.rgb(110, 200, 255)
+                "长焦" -> Color.rgb(255, 180, 80)
+                else -> Color.WHITE
+            })
+            lensBadge.visibility = View.VISIBLE
+            if (name != lastLensName) {
+                if (lastLensName.isNotEmpty()) lensBadge.animate().scaleX(1.3f).scaleY(1.3f).setDuration(120)
+                    .withEndAction { lensBadge.animate().scaleX(1f).scaleY(1f).setDuration(180).start() }.start()
+                lastLensName = name
+            }
         }
+        // ---- 对焦状态 + 锁定框 ----
+        val locked = cam?.locked == true
+        afPill.visibility = if (cam == null) View.GONE else View.VISIBLE
+        afPill.text = when {
+            locked && moved -> "🔒 检测到换目标，稳定后重新对焦"
+            locked -> "🔒 对焦已锁定 · 点屏幕重新对焦"
+            auto -> "对焦中 · %.0f 秒后自动锁定".format(maxOf(0f, (LOCK_AFTER_MS - stableMs) / 1000f))
+            else -> "自动对焦"
+        }
+        afPill.setTextColor(if (locked) Color.YELLOW else Color.WHITE)
+        if (locked && mainTv.width > 0) {
+            val u = if (ex.tapU >= 0f) ex.tapU else 0.5f
+            val v = if (ex.tapV >= 0f) ex.tapV else 0.5f
+            lockBox.translationX = mainTv.x + u * mainTv.width - dp(38)
+            lockBox.translationY = mainTv.y + v * mainTv.height - dp(38)
+            lockBox.visibility = View.VISIBLE
+        } else lockBox.visibility = View.GONE
+        // ---- 曝光读数（点击展开滑杆） ----
         val iso = cam?.resIso
         val den = cam?.resExp?.let { if (it > 0) (1e9 / it).toInt() else null }
-        val expT = listOf("自动", "快门优先", "手动")[ex.mode] + "  ISO ${iso ?: "-"}  1/${den ?: "-"}" +
-            if (ex.mode == 0) "  EV %+.1f".format(ex.ev + ex.off) else ""
-        var t = "%.1fx  %dp  镜头ID:%s\n%s\n%s".format(cam?.zoom ?: 1f, cam?.size?.height ?: 0, cam?.activeId ?: "-", af, expT)
+        expPill.visibility = if (cam == null) View.GONE else View.VISIBLE
+        expPill.text = "${expNames[ex.mode]} · ISO ${iso ?: "-"} · 1/${den ?: "-"}  ▾"
+        // ---- 录制计时 ----
+        recPill.visibility = if (recording) View.VISIBLE else View.GONE
         if (recording) {
-            val s = (SystemClock.elapsedRealtime() - recStart) / 1000
-            t += "\n● REC %02d:%02d".format(s / 60, s % 60)
+            val sec = (SystemClock.elapsedRealtime() - recStart) / 1000
+            recPill.text = "● REC %02d:%02d".format(sec / 60, sec % 60)
         }
-        status.text = t
         zoomRail.zoom = cam?.zoom ?: 1f; zoomRail.invalidate()
-        if (ex.mode == 1) { isoLabel.text = "ISO ${ex.iso}(自动)"; cam?.isoRange?.let { isoBar.progress = isoToProg(ex.iso, it.lower, it.upper) } }
+        if (expPanel.visibility == View.VISIBLE && !dragging) {      // 自动时，滑杆跟随实际值
+            val ir = cam?.isoRange
+            if (ex.mode == 0) {
+                cam?.resExp?.let { if (it > 0) shBar.progress = nearestShutter((1e9 / it).toInt()) }
+                if (ir != null) cam?.resIso?.let { isoBar.progress = isoToProg(it, ir.lower, ir.upper) }
+            } else if (ex.mode == 1 && ir != null) isoBar.progress = isoToProg(ex.iso, ir.lower, ir.upper)
+            updRows()
+        }
         refreshUi()
     }
 
