@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 對焦框 -->
+    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M30,41L30,30L41,30" />
+    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M67,30L78,30L78,41" />
+    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M30,67L30,78L41,78" />
+    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M67,78L78,78L78,67" />
+    <!-- 鏡頭 -->
+    <path android:fillColor="#FFECEFF4" android:pathData="M54,54m-17,0a17,17 0 1,0 34,0a17,17 0 1,0 -34,0" />
+    <path android:fillColor="#FF20202E" android:pathData="M54,54m-14,0a14,14 0 1,0 28,0a14,14 0 1,0 -28,0" />
+    <path android:fillColor="#FF5B3FD1" android:pathData="M54,54m-10.5,0a10.5,10.5 0 1,0 21,0a10.5,10.5 0 1,0 -21,0" />
+    <path android:fillColor="#FF140B2E" android:pathData="M54,54m-6.2,0a6.2,6.2 0 1,0 12.4,0a6.2,6.2 0 1,0 -12.4,0" />
+    <path android:fillColor="#E6FFFFFF" android:pathData="M49.6,49.6m-2.4,0a2.4,2.4 0 1,0 4.8,0a2.4,2.4 0 1,0 -4.8,0" />
+    <!-- 錄影紅點 -->
+    <path android:fillColor="#FFFF4D4D" android:pathData="M70,38m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0" />
+</vector>
