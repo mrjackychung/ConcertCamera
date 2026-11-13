@@ -1,23 +1,25 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <!-- 對焦框 -->
-    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
-        android:pathData="M30,41L30,30L41,30" />
-    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
-        android:pathData="M67,30L78,30L78,41" />
-    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
-        android:pathData="M30,67L30,78L41,78" />
-    <path android:strokeColor="#FFFFD54F" android:strokeWidth="3.6" android:strokeLineCap="round" android:strokeLineJoin="round"
-        android:pathData="M67,78L78,78L78,67" />
-    <!-- 鏡頭 -->
-    <path android:fillColor="#FFECEFF4" android:pathData="M54,54m-17,0a17,17 0 1,0 34,0a17,17 0 1,0 -34,0" />
-    <path android:fillColor="#FF20202E" android:pathData="M54,54m-14,0a14,14 0 1,0 28,0a14,14 0 1,0 -28,0" />
-    <path android:fillColor="#FF5B3FD1" android:pathData="M54,54m-10.5,0a10.5,10.5 0 1,0 21,0a10.5,10.5 0 1,0 -21,0" />
-    <path android:fillColor="#FF140B2E" android:pathData="M54,54m-6.2,0a6.2,6.2 0 1,0 12.4,0a6.2,6.2 0 1,0 -12.4,0" />
-    <path android:fillColor="#E6FFFFFF" android:pathData="M49.6,49.6m-2.4,0a2.4,2.4 0 1,0 4.8,0a2.4,2.4 0 1,0 -4.8,0" />
-    <!-- 錄影紅點 -->
-    <path android:fillColor="#FFFF4D4D" android:pathData="M70,38m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0" />
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- 正在拍攝的手機 -->
+    <path android:fillColor="#FF0D0A1C" android:strokeColor="#FFF4F4FA" android:strokeWidth="2"
+        android:pathData="M44.5,24L63.5,24Q69,24 69,29.5L69,74.5Q69,80 63.5,80L44.5,80Q39,80 39,74.5L39,29.5Q39,24 44.5,24Z" />
+    <group>
+        <clip-path android:pathData="M45,28L63,28Q66.5,28 66.5,31.5L66.5,72.5Q66.5,76 63,76L45,76Q41.5,76 41.5,72.5L41.5,31.5Q41.5,28 45,28Z" />
+        <path android:pathData="M41,27h26v50h-26z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="linear" android:startX="0" android:startY="27" android:endX="0" android:endY="77">
+                    <item android:offset="0" android:color="#FF2A1066" />
+                    <item android:offset="1" android:color="#FF7A2BB8" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path android:fillColor="#4DFFFFFF" android:pathData="M54,28L44,72L64,72Z" />
+        <path android:fillColor="#FF0A0618" android:pathData="M54,55.5m-2.7,0a2.7,2.7 0 1,0 5.4,0a2.7,2.7 0 1,0 -5.4,0" />
+        <path android:fillColor="#FF0A0618" android:pathData="M49.8,68L51.4,59.5Q54,57.8 56.6,59.5L58.2,68Z" />
+        <path android:strokeColor="#FF0A0618" android:strokeWidth="1" android:strokeLineCap="round" android:pathData="M52.4,57.2L51,53.5" />
+    </group>
+    <path android:strokeColor="#FFFFD54F" android:strokeWidth="1.7" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M46.5,51.5L46.5,48.5L49.5,48.5M58.5,48.5L61.5,48.5L61.5,51.5M46.5,66.5L46.5,69.5L49.5,69.5M58.5,69.5L61.5,69.5L61.5,66.5" />
+    <path android:fillColor="#FFFF4D4D" android:pathData="M63,32.5m-1.6,0a1.6,1.6 0 1,0 3.2,0a1.6,1.6 0 1,0 -3.2,0" />
 </vector>
