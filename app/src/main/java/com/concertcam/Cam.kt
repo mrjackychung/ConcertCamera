@@ -34,7 +34,7 @@ class Expo {
     @Volatile var iso = 200
     @Volatile var spot = true       // 点测光(跟随点击位置)
     @Volatile var protect = true    // 高光保护(强光/激光自动压曝光)
-    @Volatile var lockAe = false    // 自动锁焦时是否同时锁曝光
+    @Volatile var lockAe = true     // 锁焦时同时锁曝光(ISO/快门)
     @Volatile var tapU = -1f        // 上次点击位置(0~1，相对预览)
     @Volatile var tapV = -1f
 }
@@ -119,6 +119,8 @@ class Cam(
     private var afRect: MeteringRectangle? = null
     private var aeRect: MeteringRectangle? = null
     @Volatile var running = false
+    @Volatile var savedUri: Uri? = null      // 录像结束后保存的视频
+    private var hardExp: Pair<Int, Long>? = null   // 锁定时冻结的 ISO/快门
     @Volatile var resIso: Int? = null
     @Volatile var resExp: Long? = null
 
@@ -331,6 +333,14 @@ class Cam(
     }
 
     private fun setExp(b: CaptureRequest.Builder) {
+        val hl = hardExp
+        if (locked && hl != null && ex.mode == 0 && manualOk) {   // 锁定：用锁定瞬间的 ISO/快门，彻底不再变化
+            b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, hl.second)
+            b.set(CaptureRequest.SENSOR_SENSITIVITY, hl.first)
+            b.set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(33_333_333L, hl.second))
+            return
+        }
         if (ex.mode == 0 || !manualOk) {
             b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
             evRange?.let { rg ->
@@ -359,7 +369,7 @@ class Cam(
         val b = req ?: return
         val s = ses ?: return
         try {
-            locked = false; manualFocus = false
+            locked = false; manualFocus = false; hardExp = null
             b.set(CaptureRequest.CONTROL_AE_LOCK, false)
             b.set(CaptureRequest.CONTROL_AWB_LOCK, false)
             b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
@@ -413,7 +423,10 @@ class Cam(
                 }
                 b.set(CaptureRequest.CONTROL_AE_LOCK, ex.lockAe && ex.mode == 0)
                 b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+                val hi = resIso; val ht = resExp
+                hardExp = if (ex.lockAe && ex.mode == 0 && manualOk && hi != null && ht != null) hi to ht else null
             } else {
+                hardExp = null
                 b.set(CaptureRequest.CONTROL_AE_LOCK, false)
                 b.set(CaptureRequest.CONTROL_AWB_LOCK, false)
                 b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
@@ -424,6 +437,7 @@ class Cam(
                 }
             }
             locked = on
+            setExp(b)
             push()
         } catch (_: Exception) {}
     }
@@ -432,10 +446,12 @@ class Cam(
         closed = true
         running = false
         try { ses?.stopRepeating() } catch (_: Exception) {}
+        val wasRec = mr != null
         mr?.let { try { it.stop() } catch (_: Exception) {}; it.release() }
         mr = null
         try { pfd?.close() } catch (_: Exception) {}
         uri?.let {
+            if (wasRec) savedUri = it
             try {
                 act.contentResolver.update(it, ContentValues().apply {
                     put(MediaStore.Video.Media.IS_PENDING, 0)

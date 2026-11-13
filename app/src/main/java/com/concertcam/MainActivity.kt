@@ -4,6 +4,8 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
+import android.content.ContentUris
+import android.content.Intent
 import android.content.ClipboardManager
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -19,7 +21,10 @@ import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
+import android.net.Uri
+import android.provider.MediaStore
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -33,10 +38,12 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.TextureView
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -94,6 +101,8 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var bRec: Button
     private lateinit var bMode: Button
     private lateinit var bGear: Button
+    private lateinit var thumb: ImageView
+    private var lastVideo: Uri? = null
     private lateinit var fan: FrameLayout
     private class FanItem(val title: String, val state: () -> String,
                           val opts: () -> List<Pair<String, () -> Unit>> = { emptyList() },
@@ -139,6 +148,7 @@ class MainActivity : Activity(), SensorEventListener {
         sm = getSystemService(SENSOR_SERVICE) as SensorManager
         scanLenses()
         buildUi()
+        loadLatestVideo()
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -271,7 +281,7 @@ class MainActivity : Activity(), SensorEventListener {
         lockBox = FrameLayout(this).apply {
             background = GradientDrawable().apply { setStroke(dp(2), Color.YELLOW); setColor(Color.TRANSPARENT) }
             visibility = View.GONE
-            addView(TextView(this@MainActivity).apply { text = "🔒 锁定"; setTextColor(Color.YELLOW); textSize = 11f },
+            addView(TextView(this@MainActivity).apply { text = "🔒 AF/AE"; setTextColor(Color.YELLOW); textSize = 11f },
                 FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
         }
         root.addView(lockBox, FrameLayout.LayoutParams(dp(76), dp(76)))
@@ -305,6 +315,7 @@ class MainActivity : Activity(), SensorEventListener {
             val c = curChars() ?: return@onBar
             val r = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: return@onBar
             if (ex.mode == 2) ex.mode = 0
+            cams.firstOrNull()?.let { if (it.locked) { it.setLock(false); resetGyro() } }   // 调EV=主动改曝光，先解锁
             ex.ev = (r.lower + p) * Cam.evStep(c); ex.off = 0f
             applyExp(); updRows()
         }
@@ -348,11 +359,20 @@ class MainActivity : Activity(), SensorEventListener {
             }
             true
         }
+        thumb = ImageView(this).apply {      // 刚拍的视频缩略图，点击打开相册播放
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.argb(120, 0, 0, 0)); setStroke(dp(2), Color.WHITE) }
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+            outlineProvider = ViewOutlineProvider.BACKGROUND; clipToOutline = true
+            visibility = View.GONE
+            setOnClickListener { openLastVideo() }
+        }
         val rail = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(4), dp(8), dp(4), dp(8))
             addView(zoomRail, LinearLayout.LayoutParams(dp(72), dp(240)))
-            addView(bRec, LinearLayout.LayoutParams(dp(76), dp(76)).apply { setMargins(0, dp(14), 0, dp(14)) })
+            addView(bRec, LinearLayout.LayoutParams(dp(76), dp(76)).apply { setMargins(0, dp(14), 0, dp(10)) })
+            addView(thumb, LinearLayout.LayoutParams(dp(52), dp(52)).apply { bottomMargin = dp(10) })
             addView(bMode, LinearLayout.LayoutParams(dp(72), dp(40)))
             addView(bGear, LinearLayout.LayoutParams(dp(72), dp(40)).apply { topMargin = dp(8) })
         }
@@ -371,7 +391,7 @@ class MainActivity : Activity(), SensorEventListener {
         fanItems += FanItem("防抖", { stabNames[stab.coerceIn(0, 3)] },
             { (curChars()?.let { Cam.stabModes(it) } ?: listOf(0)).map { m -> o(stabNames[m]) { setStab(m) } } })
         fanItems += FanItem("曝光", { expNames[ex.mode] }, act = { togglePanel() })
-        fanItems += FanItem("锁焦", { if (cams.firstOrNull()?.locked == true) "锁定" else if (auto) "自动" else "关" },
+        fanItems += FanItem("AF/AE锁", { if (cams.firstOrNull()?.locked == true) "锁定" else if (auto) "自动" else "关" },
             { listOf(
                 o("自动") { auto = true; cams.firstOrNull()?.setLock(false); resetGyro() },
                 o("锁定") { cams.firstOrNull()?.setLock(true) },
@@ -718,6 +738,7 @@ class MainActivity : Activity(), SensorEventListener {
             off = off.coerceIn(-3f, 0f)
             if (off != ex.off) { ex.off = off; cam.applyExposure() }
         } else if (ex.mode == 1) {
+            if (cam.locked) return            // 锁定时 ISO 也冻结
             val ir = cam.isoRange ?: return
             val s = sampleLuma() ?: return
             val target = 110f * 2f.pow(ex.ev / 2.2f)
@@ -777,6 +798,62 @@ class MainActivity : Activity(), SensorEventListener {
         rebuild()
     }
 
+    private fun closeCams() {
+        cams.forEach { it.close() }
+        cams.mapNotNull { it.savedUri }.firstOrNull()?.let { setLastVideo(it) }
+        cams.clear()
+    }
+
+    /** 取视频第一帧做缩略图（刚保存完可能要稍等，重试几次） */
+    private fun setLastVideo(u: Uri) {
+        lastVideo = u
+        Thread {
+            var bmp: android.graphics.Bitmap? = null
+            for (i in 0 until 5) {
+                try {
+                    val r = MediaMetadataRetriever()
+                    r.setDataSource(this, u)
+                    bmp = r.getScaledFrameAtTime(500_000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 256, 256)
+                    r.release()
+                } catch (_: Exception) {}
+                if (bmp != null) break
+                try { Thread.sleep(400) } catch (_: Exception) {}
+            }
+            val b = bmp
+            runOnUiThread {
+                if (b != null) {
+                    thumb.setImageBitmap(b)
+                    thumb.visibility = View.VISIBLE
+                    thumb.scaleX = 0.4f; thumb.scaleY = 0.4f
+                    thumb.animate().scaleX(1f).scaleY(1f).setDuration(220).start()
+                }
+            }
+        }.start()
+    }
+
+    /** 启动时显示 Movies/ConcertCam 里最新的一条 */
+    private fun loadLatestVideo() {
+        Thread {
+            try {
+                contentResolver.query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Video.Media._ID),
+                    "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?", arrayOf("Movies/ConcertCam%"),
+                    "${MediaStore.Video.Media.DATE_ADDED} DESC")?.use { c ->
+                    if (c.moveToFirst()) {
+                        val u = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
+                        runOnUiThread { setLastVideo(u) }
+                    }
+                }
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    private fun openLastVideo() {
+        val u = lastVideo ?: return
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, "video/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+        } catch (_: Exception) { toast("找不到可以播放视频的应用") }
+    }
+
     private fun toggleRec() {
         recording = !recording
         if (recording) recStart = SystemClock.elapsedRealtime()
@@ -796,8 +873,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun rebuild() {
         ui.removeCallbacks(startRunnable)
-        cams.forEach { it.close() }
-        cams.clear()
+        closeCams()
         pipTv.visibility = if (mode == 2) View.VISIBLE else View.GONE
         resetGyro()
         refreshUi()
@@ -893,7 +969,7 @@ class MainActivity : Activity(), SensorEventListener {
         afPill.visibility = if (cam == null) View.GONE else View.VISIBLE
         afPill.text = when {
             locked && moved -> "🔒 检测到换目标，稳定后重新对焦"
-            locked -> "🔒 对焦已锁定 · 点屏幕重新对焦"
+            locked -> "🔒 对焦·曝光已锁定 · 点屏幕重新对焦"
             auto -> "对焦中 · %.0f 秒后自动锁定".format(maxOf(0f, (LOCK_AFTER_MS - stableMs) / 1000f))
             else -> "自动对焦"
         }
@@ -909,7 +985,7 @@ class MainActivity : Activity(), SensorEventListener {
         val iso = cam?.resIso
         val den = cam?.resExp?.let { if (it > 0) (1e9 / it).toInt() else null }
         expPill.visibility = if (cam == null) View.GONE else View.VISIBLE
-        expPill.text = "${expNames[ex.mode]} · ISO ${iso ?: "-"} · 1/${den ?: "-"}  ▾"
+        expPill.text = (if (locked) "🔒 " else "") + "${expNames[ex.mode]} · ISO ${iso ?: "-"} · 1/${den ?: "-"}  ▾"
         // ---- 录制计时 ----
         recPill.visibility = if (recording) View.VISIBLE else View.GONE
         if (recording) {
@@ -942,8 +1018,7 @@ class MainActivity : Activity(), SensorEventListener {
         super.onPause()
         sm.unregisterListener(this)
         ui.removeCallbacks(startRunnable)
-        cams.forEach { it.close() }
-        cams.clear()
+        closeCams()
         recording = false
         last = 0L
     }
